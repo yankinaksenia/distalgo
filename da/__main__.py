@@ -1,7 +1,7 @@
-# Copyright (c) 2010-2017 Bo Lin
-# Copyright (c) 2010-2017 Yanhong Annie Liu
-# Copyright (c) 2010-2017 Stony Brook University
-# Copyright (c) 2010-2017 The Research Foundation of SUNY
+# Copyright (c) 2010-2016 Bo Lin
+# Copyright (c) 2010-2016 Yanhong Annie Liu
+# Copyright (c) 2010-2016 Stony Brook University
+# Copyright (c) 2010-2016 The Research Foundation of SUNY
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -28,8 +28,8 @@ import argparse
 
 from datetime import datetime
 
-from .api import entrypoint
-from . import common
+from da.api import entrypoint, DEFAULT_MASTER_PORT, dump_trace
+from da import common
 
 MINIMUM_PYTHON_VERSION = (3, 5)
 if hasattr(sys, '_real_argv'):
@@ -62,18 +62,6 @@ def parseArgs():
     group.add_argument("-Y", "--replay-traces", nargs='+', default=[],
                         help="replays the recorded message traces "
                         "instead of running the `main` method. ")
-
-    parser.add_argument("-P", "--dump-trace", action='store_true', default=False,
-                        help="print the contents of DistAlgo trace files. "
-                        "The files to print are specified by '--replay_traces'.")
-    parser.add_argument("-Sm", "--substitute-modules", nargs='+', default=[],
-                        help="a list of ORIGMOD:NEWMOD pairs, such that all "
-                        "references to ORIGMOD will be replaced by NEWMOD "
-                        "when unpickling messages or replaying traces. ")
-    parser.add_argument("-Sc", "--substitute-classes", nargs='+', default=[],
-                        help="a list of ORIGCLS:NEWCLS pairs, such that all "
-                        "references to ORIGCLS will be replaced by NEWCLS "
-                        "when unpickling messages or replaying traces. ")
 
     parser.add_argument("--logfilename",
                         help="file name of the log file, defaults to appending"
@@ -117,11 +105,9 @@ def parseArgs():
     parser.add_argument("--inc-module-name",
                         help="name of the incrementalized interface module, "
                         "defaults to source module name + '_inc'. ")
-    parser.add_argument("-H", "--hostname", default=None,
+    parser.add_argument("-H", "--hostname", default='localhost',
                         help="hostname for binding network sockets, "
-                        "default value is the fully qualified domain "
-                        "name (FQDN) of the "
-                        "running host if '--nodename' is set, or 'localhost' "
+                        "defaults to 'localhost'. This option is ignored "
                         "if '--nodename' is not set.")
     parser.add_argument("-p", "--port", type=int, default=None,
                         help="port number for binding network sockets. "
@@ -184,7 +170,7 @@ def parseArgs():
     parser.add_argument("-r", "--recompile", dest="recompile",
                         help="force recompile DistAlgo source file. ",
                         action="store_true", default=False)
-    parser.add_argument("-c", "--compiler-flags", type=str, default="", 
+    parser.add_argument("-c", "--compiler-flags", default="",
                         help="flags to pass to the compiler, if (re)compiling "
                         "is required.")
     parser.add_argument("-o", "--config", default=[], nargs='*',
@@ -203,7 +189,7 @@ def parseArgs():
     parser.add_argument("-v", "--version", action="version",
                         version=common.__version__)
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("-m", "--module", default=None, nargs=argparse.REMAINDER,
+    group.add_argument("-m", "--module", default=None, nargs='+',
                         help="name of a DistAlgo module that will be run as "
                        "the main module. If this argument is specified, "
                        "all command line options after this point will be "
@@ -211,6 +197,9 @@ def parseArgs():
     group.add_argument("-B", "--help-builtins", action='store_true', default=False,
                        help="print a list of DistAlgo built-in functions and "
                        "exit.")
+    group.add_argument("-P", "--dump-trace", action='store_true', default=False,
+                       help="print the contents of DistAlgo trace files. "
+                       "The files to print are specified by '--replay_traces'.")
     group.add_argument("file", nargs='?',
                         help="DistAlgo source file to run.")
     parser.add_argument("args", nargs=argparse.REMAINDER,
@@ -219,6 +208,8 @@ def parseArgs():
     args = parser.parse_args()
     if args.help_builtins:
         return help_builtins()
+    elif args.dump_trace:
+        return dump_traces(args.replay_traces)
     elif not args.idle and args.module is None and args.file is None:
         parser.print_usage()
         return 1
@@ -239,6 +230,16 @@ def help_builtins():
         print("{}({}):\n\t{}\n".format(fname, sig, func.__doc__))
     return 0
 
+def dump_traces(traces):
+    if not traces:
+        die('No trace files specified.')
+    for filename in traces:
+        try:
+            dump_trace(filename)
+        except OSError as e:
+            sys.stderr.write('{}: {}\n'.format(type(e).__name__, e))
+    return 0
+
 def libmain():
     """Main program entry point.
 
@@ -254,10 +255,7 @@ def libmain():
     if isinstance(args, int):
         return args
     else:
-        try:
-            common.global_init(args.__dict__)
-        except common.ConfigurationError as e:
-            die(repr(e))
+        common.initialize_runtime_options(args.__dict__)
         return entrypoint()
 
 def die(mesg = None):

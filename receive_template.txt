@@ -1,0 +1,22 @@
+procedure receive_message_${PROCESS_NAME_PLACEHOLDER}()
+    variables sndr, mesg;
+  {
+rcv_msg:
+    while (\E snd \in ProcSet : Len(channel[snd,${PROCESS_RECEIVE_PLACEHOLDER}]) > 0) {
+      with (snd \in {proc \in ProcSet : Len(channel[proc,${PROCESS_RECEIVE_PLACEHOLDER}]) > 0}) {
+        sndr := snd;
+        mesg := Head(channel[snd,${PROCESS_RECEIVE_PLACEHOLDER}])
+      } ;
+      \* move the message to the receive history
+      rcv_history[${PROCESS_RECEIVE_PLACEHOLDER}] := Append(@, <<mesg, sndr>>);
+      \* if there is a handler for the message, execute it
+
+        ${HANDLER_CALL_PLACEHOLDER}
+      } ;
+do_rcv: \* this label is not really necessary, but we add it to be on the safe side
+      \* remove the message from the channel
+      channel[sndr,${PROCESS_RECEIVE_PLACEHOLDER}] := Tail(@)
+    }; \* end while
+    return
+  } \* end procedure
+

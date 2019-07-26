@@ -1,0 +1,46 @@
+----------------------------- MODULE program -----------------------------
+EXTENDS Integers, Sequences, TLC
+CONSTANT N (* amount of client processes*)
+(*
+--algorithm translate_dist {
+  variables
+    (* communication network, representing messages in transit *)
+    channel = [<<snd,dst>> \in ProcSet \X ProcSet |-> <<>>],
+    (* receive history per process, stores pairs of received messages and sender *)
+    rcv_history = [ proc \in ProcSet |-> <<>> ];
+    sent_history = [ proc \in ProcSet |-> <<>> ];
+
+  define {
+  (* check if process proc has some message of the given kind, sent from
+     some process in snds, in its receive history *)
+   some_received(proc, kind, snds) ==
+     LET rcvd == rcv_history[proc]
+     IN  \E i \in 1 .. Len(rcvd) :
+            /\ rcvd[i][1] = kind
+            /\ rcvd[i][2] \in snds
+
+
+   some_sent(proc, kind, rcvs) ==
+     LET sent_h == sent_history[proc]
+     IN  \E i \in 1 .. Len(sent_h) :
+            /\ sent_h[i][1] = kind
+            /\ sent_h[i][2] \in rcvs
+  } \* end define
+
+(*---------------------------------macro_for_functions----------------------------------------*)
+
+${HANDLER_PLACEHOLDER}
+
+(*---------------------------------procedures----------------------------------------*)
+
+${SEND_PLACEHOLDER}
+
+${RECEIVE_PLACEHOLDER}
+
+(*---------------------------------processes----------------------------------------*)
+
+${PROCESS_PLACEHOLDER}
+
+} \* end algorithm
+*)
+

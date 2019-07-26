@@ -1,7 +1,7 @@
-# Copyright (c) 2010-2017 Bo Lin
-# Copyright (c) 2010-2017 Yanhong Annie Liu
-# Copyright (c) 2010-2017 Stony Brook University
-# Copyright (c) 2010-2017 The Research Foundation of SUNY
+# Copyright (c) 2010-2016 Bo Lin
+# Copyright (c) 2010-2016 Yanhong Annie Liu
+# Copyright (c) 2010-2016 Stony Brook University
+# Copyright (c) 2010-2016 The Research Foundation of SUNY
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -32,21 +32,22 @@ import logging
 import warnings
 import threading
 
-from datetime import datetime
 from collections import abc, deque, namedtuple
-from inspect import signature
-from inspect import Parameter
+from inspect import signature, Parameter
 from functools import wraps
 
 MAJOR_VERSION = 1
 MINOR_VERSION = 1
 PATCH_VERSION = 0
-PRERELEASE_VERSION = "b13"
-
+PRERELEASE_VERSION = "b1"
 __version__ = "{}.{}.{}{}".format(MAJOR_VERSION, MINOR_VERSION, PATCH_VERSION,
                                    PRERELEASE_VERSION)
 
 INCOQ_MODULE_NAME = "incoq.mars.runtime"
+CONSOLE_LOG_FORMAT = \
+    '[%(relativeCreated)d] %(name)s<%(processName)s>:%(levelname)s: %(message)s'
+FILE_LOG_FORMAT = \
+    '[%(asctime)s] %(name)s<%(processName)s>:%(levelname)s: %(message)s'
 
 # a dict that contains the runtime configuration values:
 GlobalOptions = None
@@ -56,13 +57,6 @@ GlobalConfig = dict()
 CurrentNode = None
 # incoq.runtime.Type, only if using incoq:
 IncOQBaseType = None
-# all loaded DistAlgo modules, corresponds to sys.modules:
-modules = dict()
-
-CONSOLE_LOG_FORMAT = \
-    '[%(relativeCreated)d] %(name)s<%(processName)s>:%(levelname)s: %(message)s'
-FILE_LOG_FORMAT = \
-    '[%(asctime)s] %(name)s<%(processName)s>:%(levelname)s: %(message)s'
 
 # Define custom levels for text output from user code using the `output`,
 # `debug`, and `error` builtins, to differentiate output from user programs and
@@ -79,14 +73,7 @@ internal_registry = dict()
 
 class InvalidStateException(RuntimeError): pass
 
-class ConfigurationError(RuntimeError): pass
-
-
 def get_runtime_option(key, default=None):
-    """Returns the configured value of runtime option 'key', or 'default' if 'key'
-    is not configured.
-
-    """
     if GlobalOptions is None:
         if default is None:
             raise InvalidStateException("DistAlgo is not initialized.")
@@ -102,109 +89,23 @@ def set_runtime_option(key, value):
     GlobalOptions[key] = value
 
 def _version_as_bytes():
-    """Return a 4-byte representation of the version number.
+    """Return a 4-byte representation of the version.
     """
     prerelease = sum(ord(c) for c in PRERELEASE_VERSION) % 256
     return (((MAJOR_VERSION & 0xff) << 24) | ((MINOR_VERSION & 0xff) << 16) |
             ((PATCH_VERSION & 0xff) << 8) | prerelease).to_bytes(4, 'big')
 VERSION_BYTES = _version_as_bytes()
 
-def _parse_items(items):
-    subs = dict()
-    if items:
-        for item in items:
-            parts = item.split(':')
-            if len(parts) != 2:
-                raise InvalidStateException('unrecognized substitute spec: {}'
-                                            .format(item))
-            subs[parts[0]] = parts[1]
-    return subs
-
-def _set_hostname():
-    """Sets a canonical hostname for this process.
-
-    The "hostname" global option serves three distinct purposes within DistAlgo:
-    1) it determines the network interface(s) on which DistAlgo listens for
-    incoming messages; 2) it is a component of the globally unique `ProcessId`
-    used to identify DistAlgo processes; 3) during message routing, the
-    "hostname" component of the target `ProcessId` is used to determine the
-    proper forwarding path. Therefore, we must ensure that all DistAlgo
-    processes in a distributed network use the same hostname string for each
-    physical host in the network, or else message loss may occur.
-
-    """
-    import socket
-
-    hostname = GlobalOptions.get('hostname')
-    if hostname is None:
-        if len(GlobalOptions['nodename']) > 0:
-            hostname = socket.getfqdn()
-        else:
-            hostname = 'localhost'
-
-    try:
-        GlobalOptions['hostname'] = socket.gethostbyname(hostname)
-    except socket.error as e:
-        if GlobalOptions.get('hostname') is None:
-            msg = (f'This system is configured to use "{hostname}" as its fully '
-                   'qualified domain name, but it is not resolvable. Please '
-                   'specify a hostname or an IP address via the "--hostname"'
-                   '(or equivalently "-H") command line argument. If you only '
-                   'intend to connect to other DistAlgo nodes running on '
-                   'this system, you can use "-H localhost". Otherwise, '
-                   'you must specify a hostname or an IP address that is '
-                   'reachable from remote hosts.')
-        else:
-            msg = f'"{hostname}" is not a resolvable hostname.'
-        raise ConfigurationError(msg) from e
-
-
-def initialize_runtime_options(options=None):
-    """Sets and sanitizes runtime options.
-
-    'options' should be a dict-like object containing mappings from options
-    names to corresponding values.
-
-    """
-    import multiprocessing
-
-    from . import compiler
-
+def initialize_runtime_options(configs):
     global GlobalOptions
+    if GlobalOptions is not None:
+        raise InvalidStateException("DistAlgo is already initialized")
 
-    if not GlobalOptions:
-        GlobalOptions = dict()
-    if options:
-        GlobalOptions.update(options)
+    GlobalOptions = dict(configs)
 
-    # Parse '--substitute-classes' and '--substitute-modules':
-    GlobalOptions['substitute_classes'] = \
-                            _parse_items(GlobalOptions.get('substitute_classes'))
-    GlobalOptions['substitute_modules'] = \
-                            _parse_items(GlobalOptions.get('substitute_modules'))
-
-    if GlobalOptions.get('nodename') is None:
-        GlobalOptions['nodename'] = ''
-
-    _set_hostname()
-
-    # Configure multiprocessing package to use chosen semantics:
-    startmeth = GlobalOptions.get('start_method')
-    if startmeth != multiprocessing.get_start_method(allow_none=True):
-        multiprocessing.set_start_method(startmeth)
-
-    # Convert 'compiler_flags' to a namespace object that can be passed directly
-    # to the compiler:
-    GlobalOptions['compiler_args'] \
-        = compiler.ui.parse_compiler_args(
-            GlobalOptions.get('compiler_flags', '').split())
-
-    # Make sure the directory for storing trace files exists:
-    if GlobalOptions.get('record_trace'):
-        if 'logdir' not in GlobalOptions:
-            raise ConfigurationError(
-                "'record_trace' enabled without setting 'logdir'")
-        os.makedirs(GlobalOptions['logdir'], exist_ok=True)
+def _restore_runtime_options(params):
+    global GlobalOptions, GlobalConfig
+    GlobalOptions, GlobalConfig = params
 
 def set_global_config(props):
     GlobalConfig.update(props)
@@ -226,25 +127,8 @@ def get_inc_module():
         return None
     return sys.modules[GlobalOptions['inc_module_name']]
 
-def add_da_module(module):
-    """Register 'module' as a DistAlgo module.
-
-    This method is intended to be called from the importer module.
-
-    """
-    modules[module.__name__] = module
-    setup_logging_for_module(module.__name__)
-
 def sysinit():
-    """Initialize the DistAlgo system.
-
-    This function must be called before any DistAlgo code can run. Specifically,
-    every child process created under spawning semantics must call this function
-    during initialization.
-
-    """
-    # Set the format used to convert ProcessId to its string representation:
-    pid_format = GlobalOptions['pid_format']
+    pid_format = get_runtime_option('pid_format')
     if pid_format == 'full':
         ProcessId.__str__ = ProcessId.__repr__ = ProcessId._full_form_
     elif pid_format == 'long':
@@ -252,26 +136,19 @@ def sysinit():
     else:
         # default is short
         pass
-    # Setup system logging:
-    setup_logging_for_module('da', CONSOLE_LOG_FORMAT, FILE_LOG_FORMAT)
+    if GlobalOptions['record_trace']:
+        os.makedirs(GlobalOptions['logdir'], exist_ok=True)
+    load_modules()
 
-def global_init(config):
-    """Convenience method for one-time system setup.
+def _restore_module_logging():
+    assert '_da_module_cache' in GlobalOptions
+    for modulename in GlobalOptions['_da_module_cache']:
+        consolefmt, filefmt = GlobalOptions['_da_module_cache'][modulename]
+        setup_logging_for_module(modulename, consolefmt, filefmt)
 
-    This function should be called once for each node. The Python process that
-    called this function then becomes a DistAlgo node process.
-
-    """
-    initialize_runtime_options(config)
-    sysinit()
-
-DA_MODULE_CONSOLE_FORMAT = \
-    '[%(relativeCreated)d] %(name)s%(daPid)s:%(levelname)s: %(message)s'
-DA_MODULE_FILE_FORMAT = \
-    '[%(asctime)s] %(name)s%(daPid)s:%(levelname)s: %(message)s'
 def setup_logging_for_module(modulename,
-                             consolefmt=DA_MODULE_CONSOLE_FORMAT,
-                             filefmt=DA_MODULE_FILE_FORMAT):
+                             consolefmt=CONSOLE_LOG_FORMAT,
+                             filefmt=FILE_LOG_FORMAT):
     """Configures package level logger.
 
     """
@@ -280,6 +157,9 @@ def setup_logging_for_module(modulename,
         # under spawning semantics. This is fine, as logging will be setup after
         # `OSProcessContainer.run` gets called. We can safely ignore this call:
         return
+    if '_da_module_cache' not in GlobalOptions:
+        GlobalOptions['_da_module_cache'] = dict()
+    GlobalOptions['_da_module_cache'][modulename] = (consolefmt, filefmt)
     rootlog = logging.getLogger(modulename)
     rootlog.handlers = []       # Clear all handlers
 
@@ -299,12 +179,10 @@ def setup_logging_for_module(modulename,
             logfilename = GlobalOptions['logfilename']
             if logfilename is None:
                 if GlobalOptions['file'] is not None:
-                    logfilename = os.path.basename(GlobalOptions['file'])
-                elif GlobalOptions['module'] is not None:
-                    logfilename = GlobalOptions['module'][0]
+                    logfilename = \
+                             (os.path.basename(GlobalOptions['file']) + ".log")
                 else:
-                    logfilename = datetime.now().strftime('%Y-%m-%d_%H%M%S')
-                logfilename += '.log'
+                    logfilename = GlobalOptions['module'][0] + '.log'
             fh = logging.FileHandler(logfilename)
             formatter = logging.Formatter(filefmt)
             fh.setFormatter(formatter)
@@ -363,7 +241,7 @@ def name_split_host(name):
 
 def name_split_node(name):
     """Splits `name` into 'processname', 'nodename' components."""
-    assert '@' not in name
+    assert '#' not in name
     comps = name.split('#')
     if len(comps) == 2:
         return tuple(comps)
@@ -371,36 +249,6 @@ def name_split_node(name):
         return (comps[0], comps[0])
     else:
         return (None, None)
-
-#########################
-# Custom pickling
-
-class _ObjectLoader(pickle.Unpickler):
-    """Unpickler that honors the '--substitute_classes' command line option."""
-
-    def __init__(self, file, **rest):
-        super().__init__(file, **rest)
-        if GlobalOptions['substitute_classes'] or \
-           GlobalOptions['substitute_modules']:
-            self.find_class = self._find_class
-
-    def _find_class(self, module, name):
-        module = GlobalOptions['substitute_modules'].get(module, module)
-        name = GlobalOptions['substitute_classes'].get(name, name)
-        return super().find_class(module, name)
-
-def _loads(buf):
-    file = io.BytesIO(buf)
-    return _ObjectLoader(file).load()
-
-# default to the standard library if we don't need to do anything wacky:
-ObjectLoader = _ObjectLoader
-ObjectDumper = pickle.Pickler
-loads = pickle.loads
-dumps = pickle.dumps
-
-#####################
-# Process Id
 
 class ProcessId(namedtuple("_ProcessId",
                            'uid, seqno, pcls, \
@@ -508,18 +356,6 @@ class ProcessId(namedtuple("_ProcessId",
         return idcls(uid=uid, seqno=1, pcls=pcls,
                      name=name, nodename=nodename,
                      hostname=hostname, transports=transports)
-
-    def address_for_transport(self, transport):
-        """Returns the address corresponding to `transport`.
-
-        """
-        if len(self.transports) <= transport.slot_index:
-            return None
-        addr = self.transports[transport.slot_index]
-        if addr is None:
-            return None
-        else:
-            return (self.hostname, addr)
 
     def _filename_form_(self):
         """Constructs a filesystem-friendly representation of this pid.
@@ -724,8 +560,6 @@ class WaitableQueue:
         self._num_waiting = 0
         if trace_files is not None:
             self._in_file, self._out_file = trace_files
-            self._in_dumper = ObjectDumper(self._in_file)
-            self._out_dumper = ObjectDumper(self._out_file)
             self.__pop = self.pop
             self.pop = self._pop_and_record
         else:
@@ -780,53 +614,18 @@ class WaitableQueue:
             item = self.__pop(block, timeout)
             if delay:
                 delay = time.time() - delay
-            self._in_dumper.dump((delay, item))
+            pickle.dump((delay, item), self._in_file)
             return item
         except QueueEmpty as e:
             # We must record all `QueueEmpty` events as well, in order for the
             # execution to be fully reproduced:
             if delay:
                 delay = time.time() - delay
-            self._in_dumper.dump((delay, e))
+            pickle.dump((delay, e), self._in_file)
             raise e
 
     def __len__(self):
         return self._q.__len__()
-
-class ReplayQueue:
-    """A queue that simply replays recorded messages in order.
-
-    """
-    def __init__(self, in_stream, out_stream):
-        self._in_file = in_stream
-        self._out_file = out_stream
-        self._in_loader = ObjectLoader(in_stream)
-        self._out_loader = ObjectLoader(out_stream)
-
-    def pop(self, block=True, timeout=None):
-        try:
-            delay, item = self._in_loader.load()
-            if delay:
-                time.sleep(delay)
-            if isinstance(item, common.QueueEmpty):
-                raise item
-            else:
-                return item
-        except (EOFError, pickle.UnpicklingError) as e:
-            self.close()
-            raise TraceEndedException("No more items in receive trace.") from e
-
-    def close(self):
-        if self._in_file is not None:
-            self._in_file.close()
-            self._in_file = None
-        if self._out_file is not None:
-            self._out_file.close()
-            self._out_file = None
-
-
-#########################
-# LRU queue:
 
 class Node(object):
     __slots__ = ['prev', 'next', 'me']
@@ -981,46 +780,75 @@ class ModuleIntrument(object):
         delattr(self._control, attr)
         delattr(self._subject, attr)
 
+class frozendict(dict):
+    """Hashable immutable dict implementation
 
-def _install():
-    """Hooks into `multiprocessing.spawn` so that GlobalOptions is propagated to
-    child processes *before* they attempt to load any DistAlgo modules.
+    Copied from http://code.activestate.com/recipes/414283/
 
     """
-    import multiprocessing.spawn
+    def _blocked_attribute(obj):
+        raise AttributeError("A frozendict cannot be modified.")
+    _blocked_attribute = property(_blocked_attribute)
 
-    spawn_prepare = multiprocessing.spawn.prepare
-    spawn_get_preparation_data = multiprocessing.spawn.get_preparation_data
-    spawn_get_command_line = multiprocessing.spawn.get_command_line
+    __delitem__ = __setitem__ = clear = _blocked_attribute
+    pop = popitem = setdefault = update = _blocked_attribute
 
-    def _advised_prepare(data):
-        global GlobalOptions
-        global GlobalConfig
+    def __new__(cls, *args, **kws):
+        new = dict.__new__(cls)
+        dict.__init__(new, *args, **kws)
+        return new
 
-        if 'global_options' in data:
-            GlobalOptions = data['global_options']
+    def __init__(self, *args, **kws):
+        pass
 
-        if 'global_config' in data:
-            GlobalConfig = data['global_config']
+    def __hash__(self):
+        try:
+            return self._cached_hash
+        except AttributeError:
+            h = self._cached_hash = hash(tuple(sorted(self.items())))
+            return h
 
-        return spawn_prepare(data)
+    def __repr__(self):
+        return "frozendict(%s)" % dict.__repr__(self)
 
-    def _advised_get_preparation_data(name):
-        d = spawn_get_preparation_data(name)
-        d['global_options'] = GlobalOptions
-        d['global_config'] = GlobalConfig
-        return d
+BuiltinImmutables = [int, float, complex, tuple, str, bytes, frozenset]
 
-    def _advised_get_command_line(**kwds):
-        cmd = spawn_get_command_line(**kwds)
-        if len(cmd) < 3 or cmd[1] != '-c':
-            raise RuntimeError('Unsupported Python version!!!')
-        cmd[2] = 'import da; ' + cmd[2]
-        return cmd
+def freeze(obj):
+    """Return a hashable version of `obj`.
 
-    multiprocessing.spawn.prepare = _advised_prepare
-    multiprocessing.spawn.get_preparation_data = _advised_get_preparation_data
-    multiprocessing.spawn.get_command_line = _advised_get_command_line
+    Contents of `obj` may be copied if necessary.
+
+    """
+    if any(isinstance(obj, itype) for itype in BuiltinImmutables):
+        return obj
+
+    if IncOQBaseType is not None:
+        if isinstance(obj, IncOQBaseType):
+            return copy.deepcopy(obj)
+
+    if isinstance(obj, abc.MutableSequence):
+        if isinstance(obj, abc.ByteString):
+            # bytearray -> bytes
+            return bytes(obj)
+        else:
+            # list -> tuple
+            return tuple(freeze(elem) for elem in obj)
+    elif isinstance(obj, abc.MutableSet):
+        # set -> frozenset
+        return frozenset(freeze(elem) for elem in obj)
+    elif isinstance(obj, abc.MutableMapping):
+        # dict -> frozendict
+        return frozendict((freeze(k), freeze(v)) for k, v in obj.items())
+    elif isinstance(obj, abc.Sequence):
+        #NOTE: This part is fragile. For immutable sequence objects, we still
+        # have to recursively freeze its elements, which means we have to create
+        # a new instance of the same type. Here we just assume the class
+        # `__init__` method takes a 'iterable' as argument. Otherwise,
+        # everything falls apart.
+        return type(obj)(freeze(e) for e in obj)
+    else:
+        # everything else just assume hashable & immutable, hahaha:
+        return obj
 
 if __name__ == "__main__":
     @api
@@ -1036,4 +864,6 @@ if __name__ == "__main__":
     def testdepre():
         print("deprecated function")
 
+    t = ('a', 1)
+    print("Freeze " + str(t) + "->" + str(freeze(t)))
     testdepre()

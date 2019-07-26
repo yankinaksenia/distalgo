@@ -1,0 +1,7 @@
+procedure send(msg,sender, receiver)
+{
+    send_check:
+    channel[sender,receiver] := Append(@, msg);
+    sent_history[sender] := Append(@, <<msg, receiver>>);
+    return
+}

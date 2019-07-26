@@ -1,7 +1,7 @@
-# Copyright (c) 2010-2017 Bo Lin
-# Copyright (c) 2010-2017 Yanhong Annie Liu
-# Copyright (c) 2010-2017 Stony Brook University
-# Copyright (c) 2010-2017 The Research Foundation of SUNY
+# Copyright (c) 2010-2016 Bo Lin
+# Copyright (c) 2010-2016 Yanhong Annie Liu
+# Copyright (c) 2010-2016 Stony Brook University
+# Copyright (c) 2010-2016 The Research Foundation of SUNY
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -22,27 +22,23 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-import io
 import sys
 import copy
 import enum
 import time
-import pickle
 import random
+import pickle
 import logging
-import itertools
 import functools
 import threading
 import collections
 import multiprocessing
 import os.path
 
-from . import common, pattern
+from . import common, pattern, endpoint
 from .common import (builtin, internal, name_split_host, name_split_node,
-                     ProcessId, get_runtime_option,
-                     ObjectDumper, ObjectLoader)
-from .transport import ChannelCaps, TransportManager, HEADER_SIZE, \
-    TransportException, AuthenticationException
+                     ProcessId, get_runtime_option)
+from .endpoint import ChannelCaps
 
 logger = logging.getLogger(__name__)
 
@@ -105,22 +101,29 @@ class DistProcess():
     be created by calling `new`.
 
     """
-    def __init__(self, procimpl, forwarder, **props):
+    def __init__(self, procimpl, is_replay=False, **props):
         self.__procimpl = procimpl
         self.__id = procimpl.dapid
         self._log = logging.LoggerAdapter(
             logging.getLogger(self.__class__.__module__)
-            .getChild(self.__class__.__name__), {'daPid' : self._id})
+            .getChild(self.__class__.__qualname__), {'daPid' : self._id})
         self.__newcmd_seqno = procimpl.seqno
         self.__messageq = procimpl.router.get_queue_for_process(self._id)
-        self.__forwarder = forwarder
+        if is_replay:
+            self.__forwarder = procimpl.router.replay_send
+            self._create_cmd_seqno = self.__create_dummy_cmd_seqno_for_recording
+        elif get_runtime_option('record_trace'):
+            self.__forwarder = procimpl.router.send
+            self._create_cmd_seqno = self.__create_dummy_cmd_seqno_for_recording
+        else:
+            self.__forwarder = procimpl.router.send
         self.__properties = props
         self.__jobq = collections.deque()
         self.__lock = threading.Lock()
         self.__local = threading.local()
         self.__local.timer = None
         self.__local.timer_expired = False
-        self.__seqcnt = itertools.count(start=0)
+        self.__local.seqcnt = 0
         self.__setup_called = False
         self.__running = False
         self.__parent = procimpl.daparent
@@ -173,10 +176,6 @@ class DistProcess():
             self.__do_label = self.__label_all
         else:
             self.__do_label = self.__label_one
-        if self.get_config('unmatched', default='drop').casefold() == 'keep':
-            self._keep_unmatched = True
-        else:
-            self._keep_unmatched = False
         self.__default_flags = self.__get_channel_flags(
             self.get_config("channel", default=[]))
         if self.get_config('clock', default='').casefold() == 'lamport':
@@ -550,14 +549,10 @@ class DistProcess():
                            message=((procname, nodename), host, port, seqno),
                            to=self.__procimpl._nodeid,
                            flags=ChannelCaps.RELIABLEFIFO):
-                res = self._sync_async_event(Command.ResolveAck, seqno,
-                                             self.__procimpl._nodeid)
-                dest = res[self.__procimpl._nodeid]
-                self._log.debug("%r successfully resolved to %r.", name, dest)
+                res = self._sync_async_event(Command.ResolveAck, seqno, self._id)
+                dest = res[self._id]
             else:
                 self._deregister_async_event(Command.ResolveAck, seqno)
-                self._log.error("Unable to resolve %r: failed to send "
-                                "request to node!", name)
         return dest
 
     @internal
@@ -677,7 +672,6 @@ class DistProcess():
 
     def __process_jobqueue(self, label=None):
         """Runs all pending handlers jobs permissible at `label`.
-
         """
         leftovers = []
         handler = args = None
@@ -695,40 +689,33 @@ class DistProcess():
                 (handler._notlabels is None or label not in handler._notlabels)):
                 try:
                     handler(**args)
-                    if self.__do_label is self.__label_one:
-                        break
                 except Exception as e:
                     self._log.error(
                         "%r when calling handler '%s' with '%s': %s",
                         e, handler.__name__, args, e)
             else:
-                if self._keep_unmatched:
-                    dbgmsg = "Skipping (%s, %r) due to label constraint."
-                    leftovers.append((handler, args))
-                else:
-                    dbgmsg = "Dropping (%s, %r) due to label constraint."
-                self._log.debug(dbgmsg, handler, args)
+                self._log.debug("Skipping (%s, %r) due to label constraint.",
+                                handler, args)
+                leftovers.append((handler, args))
         self.__jobq.extend(leftovers)
 
     @internal
     def _create_cmd_seqno(self):
-        """Returns a unique sequence number for pairing command messages to their
-    replies.
+        cnt = self.__local.seqcnt = (self.__local.seqcnt + 1) % 1024
+        return (threading.current_thread().ident << 10) | cnt
+
+    def __create_dummy_cmd_seqno_for_recording(self):
+        """Version of `_create_cmd_seqno` for recording and replaying traces.
+
+        In order for sequence numbers to be reproducible, we remove the
+        randomizing factor (i.e. the current thread id) in their generation.
+        This version will not be safe if there are user-created threads, but it
+        is fine since it is impossible to have reproducible traces in the
+        presence of user-created threads anyway.
 
         """
-        cnt = self.__seqcnt
-        # we piggyback off the GIL for thread-safety:
-        seqno = next(cnt)
-        # when the counter value gets too big, itertools.count will switch into
-        # "slow mode"; we don't want slow, and we don't need that many unique
-        # values simultaneously, so we just reset the counter once in a while:
-        if seqno > 0xfffffff0:
-            with self.__lock:
-                # this test checks that nobody else has reset the counter before
-                # we acquired the lock:
-                if self.__seqcnt is cnt:
-                    self.__seqcnt = itertools.count(start=0)
-        return seqno
+        cnt = self.__local.seqcnt = (self.__local.seqcnt + 1) % 0xffffffff
+        return cnt
 
     @internal
     def _register_async_event(self, msgtype, seqno):
@@ -857,7 +844,6 @@ class DistProcess():
     @internal
     def _cmd_Setup(self, src, args):
         seqno, realargs = args
-        res = True
         if self.__setup_called:
             self._log.warning("`setup` already called for this process!")
         else:
@@ -868,14 +854,8 @@ class DistProcess():
                 self._log.debug("`setup` complete.")
             except Exception as e:
                 self._log.error("Exception during setup(%r): %r", args, e)
-                self._log.debug("%r", e, exc_info=1)
-                res = False
-            if hasattr(sys.stdout, 'flush'):
-                sys.stdout.flush()
-            if hasattr(sys.stderr, 'flush'):
-                sys.stderr.flush()
         self._send1(msgtype=Command.SetupAck,
-                    message=(seqno, res),
+                    message=(seqno, True),
                     to=src,
                     flags=ChannelCaps.RELIABLEFIFO)
 
@@ -945,8 +925,8 @@ class NodeProcess(DistProcess):
 
     AckCommands = DistProcess.AckCommands + [Command.NodeAck]
 
-    def __init__(self, procimpl, forwarder, **props):
-        super().__init__(procimpl, forwarder, **props)
+    def __init__(self, procimpl, **props):
+        super().__init__(procimpl, **props)
         self._router = procimpl.router
         self._nodes = set()
 
@@ -1068,16 +1048,10 @@ def process_trace_header(tracefd, trace_type):
     if typ != trace_type:
         raise TraceFormatException('{}: expecting type {} but is {}'
                                    .format(typ, trace_type))
-    loader = ObjectLoader(tracefd)
-    try:
-        pid = loader.load()
-    except (ImportError, AttributeError) as e:
-        raise TraceMismatchException(
-            "{}, please check the "
-            "-m, -Sm, -Sc, or 'file' command line arguments.\n".format(e))
+    pid = pickle.load(tracefd)
     if not isinstance(pid, ProcessId):
         raise TraceCorruptedException(tracefd.name)
-    parentid = loader.load()
+    parentid = pickle.load(tracefd)
     if not isinstance(parentid, ProcessId):
         raise TraceCorruptedException(tracefd.name)
     return pid, parentid
@@ -1086,9 +1060,37 @@ def write_trace_header(pid, parent, trace_type, stream):
     stream.write(TRACE_HEADER)
     stream.write(common.VERSION_BYTES)
     stream.write(bytes([trace_type]))
-    dumper = ObjectDumper(stream)
-    dumper.dump(pid)
-    dumper.dump(parent)
+    pickle.dump(pid, stream)
+    pickle.dump(parent, stream)
+
+class ReplayQueue:
+    """A queue that simply replays recorded messages in order.
+
+    """
+    def __init__(self, in_stream, out_stream):
+        self._in_file = in_stream
+        self._out_file = out_stream
+
+    def pop(self, block=True, timeout=None):
+        try:
+            delay, item = pickle.load(self._in_file)
+            if delay:
+                time.sleep(delay)
+            if isinstance(item, common.QueueEmpty):
+                raise item
+            else:
+                return item
+        except (EOFError, pickle.UnpicklingError) as e:
+            self.close()
+            raise TraceEndedException("No more items in receive trace.") from e
+
+    def close(self):
+        if self._in_file is not None:
+            self._in_file.close()
+            self._in_file = None
+        if self._out_file is not None:
+            self._out_file.close()
+            self._out_file = None
 
 class Router(threading.Thread):
     """The router thread.
@@ -1100,15 +1102,14 @@ class Router(threading.Thread):
     def __init__(self, transport_manager):
         threading.Thread.__init__(self)
         self.log = logging.getLogger(__name__) \
-                          .getChild(self.__class__.__name__)
+                          .getChild(self.__class__.__qualname__)
         self.daemon = True
         self.running = False
-        self.prestart_mesg_sink = []
         self.bootstrap_peer = None
-        self.transport_manager = transport_manager
+        self.endpoint = transport_manager
         self.hostname = get_runtime_option('hostname')
         self.payload_size = get_runtime_option('message_buffer_size') - \
-                            HEADER_SIZE
+                            endpoint.HEADER_SIZE
         self.local_procs = dict()
         self.local = threading.local()
         self.local.buf = None
@@ -1120,35 +1121,44 @@ class Router(threading.Thread):
 
     def register_local_process(self, pid, parent=None):
         assert isinstance(pid, ProcessId)
-        with self.lock:
-            if pid in self.local_procs:
-                self.log.warning("Registering duplicate process: %s.", pid)
-            self.local_procs[pid] = common.WaitableQueue()
-        self.log.debug("Process %s registered.", pid)
+        if self.running:
+            with self.lock:
+                if pid in self.local_procs:
+                    self.log.warning("Registering duplicate process: %s.", pid)
+                self.local_procs[pid] = common.WaitableQueue()
+            self.log.debug("Process %s registered.", pid)
+        else:
+            raise InvalidRouterStateException("Router not running.")
 
     def replay_local_process(self, pid, in_stream, out_stream):
         assert isinstance(pid, ProcessId)
-        with self.lock:
-            if pid in self.local_procs:
-                self.log.warning("Registering duplicate process: %s.", pid)
-            self.local_procs[pid] = common.ReplayQueue(in_stream, out_stream)
-        self.log.debug("Process %s registered.", pid)
+        if self.running:
+            with self.lock:
+                if pid in self.local_procs:
+                    self.log.warning("Registering duplicate process: %s.", pid)
+                self.local_procs[pid] = ReplayQueue(in_stream, out_stream)
+            self.log.debug("Process %s registered.", pid)
+        else:
+            raise InvalidRouterStateException("Router not running.")
 
     def _record_local_process(self, pid, parent=None):
         assert isinstance(pid, ProcessId)
-        basedir = get_runtime_option('logdir')
-        infd = open(os.path.join(basedir,
-                                 pid._filename_form_() + ".trace"), "wb")
-        outfd = open(os.path.join(basedir,
-                                  pid._filename_form_() + ".snd"), "wb")
-        write_trace_header(pid, parent, TRACE_TYPE_RECV, infd)
-        write_trace_header(pid, parent, TRACE_TYPE_SEND, outfd)
-        with self.lock:
-            if pid in self.local_procs:
-                self.log.warning("Registering duplicate process: %s.", pid)
-            self.local_procs[pid] \
-                = common.WaitableQueue(trace_files=(infd, outfd))
-        self.log.debug("Process %s registered.", pid)
+        if self.running:
+            basedir = get_runtime_option('logdir')
+            infd = open(os.path.join(basedir,
+                                     pid._filename_form_() + ".trace"), "wb")
+            outfd = open(os.path.join(basedir,
+                                      pid._filename_form_() + ".snd"), "wb")
+            write_trace_header(pid, parent, TRACE_TYPE_RECV, infd)
+            write_trace_header(pid, parent, TRACE_TYPE_SEND, outfd)
+            with self.lock:
+                if pid in self.local_procs:
+                    self.log.warning("Registering duplicate process: %s.", pid)
+                self.local_procs[pid] \
+                    = common.WaitableQueue(trace_files=(infd, outfd))
+            self.log.debug("Process %s registered.", pid)
+        else:
+            raise InvalidRouterStateException("Router not running.")
 
     def deregister_local_process(self, pid):
         if self.running:
@@ -1186,8 +1196,8 @@ class Router(threading.Thread):
                             transports=\
                             tuple(port for _ in range(len(nid.transports))))
         self.log.debug("Dummy id: %r", dummyid)
-        for transport in self.transport_manager.transports:
-            self.log.debug("Attempting bootstrap using %s...", transport)
+        for transport in self.endpoint.transports:
+            self.log.debug("Attempting bootstrap using %r...", transport)
             try:
                 self._send_remote(src=nid,
                                   dest=dummyid,
@@ -1202,14 +1212,14 @@ class Router(threading.Thread):
                     return
                 else:
                     self.log.debug(
-                        "Bootstrap attempt to %s:%d with %s timed out. ",
+                        "Bootstrap attempt to %s:%d with %r timed out. ",
                         hostname, port, transport)
                     self.bootstrap_peer = None
-            except AuthenticationException as e:
+            except endpoint.AuthenticationException as e:
                 # Abort immediately:
                 raise e
-            except (CircularRoutingException, TransportException) as e:
-                self.log.debug("Bootstrap attempt to %s:%d with %s failed "
+            except endpoint.TransportException as e:
+                self.log.debug("Bootstrap attempt to %s:%d with %r failed "
                                ": %r", hostname, port, transport, e)
         if self.bootstrap_peer is None:
             raise BootstrapException("Unable to contact a peer node.")
@@ -1244,12 +1254,9 @@ class Router(threading.Thread):
     def run(self):
         try:
             self.running = True
-            for item in self.prestart_mesg_sink:
-                self._dispatch(*item)
-            self.prestart_mesg_sink = []
             self.mesgloop(until=(lambda: not self.running))
         except Exception as e:
-            self.log.debug("Unhandled exception: %r.", e, exc_info=1)
+            self.log.debug("Unhandled exception: %r.", e)
         self.terminate_local_processes()
 
     def stop(self):
@@ -1279,7 +1286,7 @@ class Router(threading.Thread):
         # This test is necessary because a dead process might still be active
         # one user-created threads:
         if queue is not None:
-            queue._out_dumper.dump((rectype, res))
+            pickle.dump((rectype, res), queue._out_file)
 
     def replay_send(self, src, dest, mesg, params=dict(), flags=0,
                      impersonate=None):
@@ -1294,7 +1301,7 @@ class Router(threading.Thread):
         queue = self.local_procs.get(targetpid, None)
         assert queue is not None
         try:
-            return queue._out_loader.load()
+            return pickle.load(queue._out_file)
         except EOFError as e:
             raise TraceEndedException("No more items in send trace.") from e
 
@@ -1306,7 +1313,7 @@ class Router(threading.Thread):
                        mesg, dest, flags)
         if dest.hostname != self.hostname:
             flags |= ChannelCaps.INTERHOST
-        elif dest.transports == self.transport_manager.transport_addresses:
+        elif dest.transports == self.endpoint.transport_addresses:
             # dest is not in our local_procs but has same hostname and transport
             # address, so most likely dest is a process that has already
             # terminated. Do not attempt forwarding or else will cause infinite
@@ -1314,7 +1321,7 @@ class Router(threading.Thread):
             raise CircularRoutingException('destination: {}'.format(dest))
 
         if transport is None:
-            transport = self.transport_manager.get_transport(flags)
+            transport = self.endpoint.get_transport(flags)
         if transport is None:
             raise NoAvailableTransportException()
         if not hasattr(self.local, 'buf') or self.local.buf is None:
@@ -1336,8 +1343,7 @@ class Router(threading.Thread):
         self.log.debug("** Forwarding %r(%d bytes) to %s with flags=%d using %s.",
                        mesg, wrapper.fptr, dest, flags, transport)
         with memoryview(self.local.buf)[0:wrapper.fptr] as chunk:
-            transport.send(chunk, dest.address_for_transport(transport),
-                           **params)
+            transport.send(chunk, dest, **params)
 
     def _dispatch(self, src, dest, payload, params=dict(), flags=0):
         if dest in self.local_procs:
@@ -1359,12 +1365,6 @@ class Router(threading.Thread):
                                  dest, e)
                 return False
         elif dest is not None:
-            if not self.running:
-                # We are still in bootstrap mode, which means this may be a
-                # message destined for a process that has yet to register, so
-                # save it in a sink to be dispatched later in run():
-                self.prestart_mesg_sink.append((src, dest, payload))
-                return True
             try:
                 self._send_remote(src, dest, payload, flags, **params)
                 return True
@@ -1391,28 +1391,25 @@ class Router(threading.Thread):
                 return False
 
     def mesgloop(self, until, timeout=None):
-        incomingq = self.transport_manager.queue
+        incomingq = self.endpoint.queue
         if timeout is not None:
             start = time.time()
             timeleft = timeout
         else:
             timeleft = None
         while True:
-            transport, remote = "<unknown>", "<unknown>"
-            chunk = None
             try:
                 transport, chunk, remote = incomingq.pop(block=True,
                                                          timeout=timeleft)
                 if transport.data_offset > 0:
                     chunk = memoryview(chunk)[transport.data_offset:]
                 src, dest, mesg = pickle.loads(chunk)
+                chunk = None
                 self._dispatch(src, dest, mesg)
             except common.QueueEmpty:
                 pass
-            except (ImportError, ValueError, pickle.UnpicklingError) as e:
-                self.log.warning(
-                    "Dropped invalid message from %s through %s: %r",
-                    remote, transport, e)
+            except (ValueError, pickle.UnpicklingError) as e:
+                self.log.warning("Dropped invalid message: %r", chunk)
             if until():
                 break
             if timeout is not None:
@@ -1420,10 +1417,6 @@ class Router(threading.Thread):
                 if timeleft <= 0:
                     break
 
-def _is_spawning_semantics():
-    """True if we are on spawning semantics."""
-    return sys.platform == 'win32' or \
-        multiprocessing.get_start_method(allow_none=True) == 'spawn'
 
 class ProcessContainer:
     """An abstract base class for process containers.
@@ -1439,7 +1432,6 @@ class ProcessContainer:
         super().__init__()
         # Logger can not be serialized so it has to be instantiated in the child
         # proc's address space:
-        self.before_run_hooks = []
         self._log = None
         self._dacls = process_class
         self._daobj = None
@@ -1453,8 +1445,8 @@ class ProcessContainer:
         self._trace_out_fd = None
         if len(process_name) > 0:
             self.name = process_name
-        self.transport_manager = transport_manager
-        if _is_spawning_semantics():
+        self.endpoint = transport_manager
+        if multiprocessing.get_start_method() == 'spawn':
             setattr(self, '_spawn_process', self._spawn_process_spawn)
         else:
             setattr(self, '_spawn_process', self._spawn_process_fork)
@@ -1497,6 +1489,7 @@ class ProcessContainer:
                 .format(tracename, sndname)
             )
         self._dacls = self.dapid.pcls
+        self._properties['is_replay'] = True
 
     def cleanup(self):
         if self._trace_in_fd:
@@ -1504,13 +1497,10 @@ class ProcessContainer:
         if self._trace_out_fd:
             self._trace_out_fd.close()
 
-    def init_router(self):
-        if self.router is None:
-            self.transport_manager.start()
-            self.router = Router(self.transport_manager)
-
     def start_router(self):
-        if not self.router.running:
+        if self.router is None:
+            self.endpoint.start()
+            self.router = Router(self.endpoint)
             self.router.start()
 
     def end(self):
@@ -1527,7 +1517,7 @@ class ProcessContainer:
         cid = None
         parent_pipe = child_pipe = None
         try:
-            trman = TransportManager(cookie=self.transport_manager.authkey)
+            trman = endpoint.TransportManager(cookie=self.endpoint.authkey)
             trman.initialize()
             cid = ProcessId._create(pcls, trman.transport_addresses, name)
             parent_pipe, child_pipe = multiprocessing.Pipe()
@@ -1566,7 +1556,7 @@ class ProcessContainer:
         p = None
         cid = None
         try:
-            trman = TransportManager(cookie=self.transport_manager.authkey)
+            trman = endpoint.TransportManager(cookie=self.endpoint.authkey)
             trman.initialize()
             cid = ProcessId._create(pcls, trman.transport_addresses, name)
             p = OSProcessContainer(process_class=pcls,
@@ -1598,10 +1588,10 @@ class ProcessContainer:
         cid = None
         try:
             cid = ProcessId._create(pcls,
-                                    self.transport_manager.transport_addresses,
+                                    self.endpoint.transport_addresses,
                                     name)
             p = OSThreadContainer(process_class=pcls,
-                                  transport_manager=self.transport_manager,
+                                  transport_manager=self.endpoint,
                                   process_id=cid,
                                   parent_id=parent,
                                   process_name=name,
@@ -1665,26 +1655,90 @@ class ProcessContainer:
                                          .format(rectype))
         return children
 
+class OSProcessContainer(ProcessContainer, multiprocessing.Process):
+    """An implementation of processes using OS process.
+
+    """
+    def __init__(self, daemon=False, pipe=None, **rest):
+        super().__init__(**rest)
+        self.daemon = daemon
+        if multiprocessing.get_start_method() == 'spawn':
+            self.pipe = pipe
+            self._rtopts = (common.GlobalOptions, common.GlobalConfig)
+
+    def _debug_handler(self, sig, frame):
+        self._debugger.set_trace(frame)
+
     def run(self):
         self._log = logger.getChild(self.__class__.__qualname__)
         if len(self.name) == 0:
             self.name = str(self.pid)
-
         try:
-            for hook in self.before_run_hooks:
-                hook()
+            if multiprocessing.get_start_method() == 'spawn':
+                common._restore_runtime_options(self._rtopts)
+                common._set_node(self._nodeid)
+                common.set_runtime_option('this_module_name',
+                                          self.__class__.__module__)
+                common.sysinit()
+                common._restore_module_logging()
+                assert self.pipe is not None
+                self.endpoint.initialize(pipe=self.pipe)
+                del self.pipe
 
-            self.init_router()
+            self.start_router()
             if not self._trace_out_fd:
-                forwarder = self.router.send
                 self.router.register_local_process(self.dapid, self.daparent)
             else:
-                forwarder = self.router.replay_send
                 self.router.replay_local_process(self.dapid,
                                                  self._trace_in_fd,
                                                  self._trace_out_fd)
+
+            self._daobj = self._dacls(self, **(self._properties))
+            self._log.debug("Process object initialized.")
+
+            return self._daobj._delayed_start()
+
+        except DistProcessExit as e:
+            self._log.debug("Caught %r, exiting gracefully.", e)
+            return e.exit_code
+        except RoutingException as e:
+            self._log.debug("Caught %r.", e)
+            return 2
+        except TraceException as e:
+            self._log.error("%r occurred.", e)
+            self._log.debug(e, exc_info=1)
+            return 3
+        except KeyboardInterrupt as e:
+            self._log.debug("Received KeyboardInterrupt, exiting")
+            return 1
+        except Exception as e:
+            self._log.error("Unexpected error: %r", e, exc_info=1)
+        finally:
+            if self.router is not None:
+                self.router.deregister_local_process(self.dapid)
+            self.cleanup()
+
+class OSThreadContainer(ProcessContainer, threading.Thread):
+    """An implementation of processes using OS threads.
+
+    """
+    def __init__(self, daemon=False, **rest):
+        super().__init__(**rest)
+        self.daemon = daemon
+
+    def run(self):
+        self._log = logger.getChild(self.__class__.__qualname__)
+        if len(self.name) == 0:
+            self.name = str(self.pid)
+        try:
             self.start_router()
-            self._daobj = self._dacls(self, forwarder, **(self._properties))
+            if not self._trace_out_fd:
+                self.router.register_local_process(self.dapid, self.daparent)
+            else:
+                self.router.replay_local_process(self.dapid,
+                                                 self._trace_in_fd,
+                                                 self._trace_out_fd)
+            self._daobj = self._dacls(self, **(self._properties))
             self._log.debug("Process object initialized.")
 
             return self._daobj._delayed_start()
@@ -1709,32 +1763,3 @@ class ProcessContainer:
             if self.router is not None:
                 self.router.deregister_local_process(self.dapid)
             self.cleanup()
-
-class OSProcessContainer(ProcessContainer, multiprocessing.Process):
-    """An implementation of processes using OS process.
-
-    """
-    def __init__(self, daemon=False, pipe=None, **rest):
-        super().__init__(**rest)
-        self.daemon = daemon
-        self.pipe = pipe
-        if _is_spawning_semantics():
-            self.before_run_hooks.append(self._init_for_spawn)
-
-    def _debug_handler(self, sig, frame):
-        self._debugger.set_trace(frame)
-
-    def _init_for_spawn(self):
-        common._set_node(self._nodeid)
-        assert self.pipe is not None
-        self.transport_manager.initialize(pipe=self.pipe)
-        del self.pipe
-
-
-class OSThreadContainer(ProcessContainer, threading.Thread):
-    """An implementation of processes using OS threads.
-
-    """
-    def __init__(self, daemon=False, **rest):
-        super().__init__(**rest)
-        self.daemon = daemon

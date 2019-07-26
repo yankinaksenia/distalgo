@@ -1,7 +1,7 @@
-# Copyright (c) 2010-2017 Bo Lin
-# Copyright (c) 2010-2017 Yanhong Annie Liu
-# Copyright (c) 2010-2017 Stony Brook University
-# Copyright (c) 2010-2017 The Research Foundation of SUNY
+# Copyright (c) 2010-2016 Bo Lin
+# Copyright (c) 2010-2016 Yanhong Annie Liu
+# Copyright (c) 2010-2016 Stony Brook University
+# Copyright (c) 2010-2016 The Research Foundation of SUNY
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -29,11 +29,9 @@ from ast import *
 from collections import abc
 
 from da import common
-from . import dast
-from .utils import Namespace
-from .utils import CompilerMessagePrinter
-from .utils import MalformedStatementError
-from .utils import ResolverException
+from da.compiler import dast
+from da.compiler.tlaast import Transformer, Writer, AstWriter
+from da.compiler.utils import printe, printw, printd, Namespace
 
 # DistAlgo keywords
 KW_ENTRY_POINT = "main"
@@ -87,69 +85,6 @@ def is_setup_func(node):
     return (isinstance(node, FunctionDef) and
             node.name == KW_SETUP)
 
-def is_process_class(node):
-    """True if `node` is a process class.
-
-    A process class is a class whose bases contain the name $KW_PROCESS_DEF.
-
-    """
-    if isinstance(node, ClassDef):
-        for b in node.bases:
-            if isinstance(b, Name) and b.id == KW_PROCESS_DEF:
-                return True
-    return False
-
-def expr_check(names, minargs, maxargs, node,
-               keywords={}, optional_keywords={}):
-    """Check a Call node against the requirements.
-
-    """
-    if not (isinstance(node, Call) and
-            isinstance(node.func, Name) and
-            (((isinstance(names, abc.Set) or
-               isinstance(names, abc.Mapping)) and
-              node.func.id in names) or
-             node.func.id == names)):
-        return False
-
-    try:
-        if minargs is not None and len(node.args) < minargs:
-            raise MalformedStatementError("too few arguments.")
-        if maxargs is not None and len(node.args) > maxargs:
-            raise MalformedStatementError("too many arguments.")
-        if keywords is not None:
-            for kw in node.keywords:
-                if kw.arg in keywords:
-                    keywords -= {kw.arg}
-                elif optional_keywords is not None and \
-                     kw.arg not in optional_keywords:
-                    raise MalformedStatementError(
-                        "unrecognized keyword: '%s'." % kw.arg)
-            if len(keywords) > 0:
-                raise MalformedStatementError(
-                    "missing required keywords: " + str(keywords))
-    except MalformedStatementError as e:
-        # Pre-format an error message for the common case:
-        e.node = node
-        e.name = node.func.id
-        e.msg = "malformed {stname} statement: {msg}".format(
-            stname=e.name, msg=e.reason)
-        raise e
-
-    return True
-
-def kw_check(names, node):
-    if not isinstance(node, Name) or node.id not in names:
-        return False
-    return True
-
-def is_await(node):
-    """True if `node` is an await statement.
-
-    """
-    return (expr_check(KW_AWAIT, 1, 1, node) or
-            isinstance(node, Await))
-
 def extract_label(node):
     """Returns the label name specified in 'node', or None if 'node' is not a
     label.
@@ -163,7 +98,7 @@ def extract_label(node):
     else:
         return None
 
-def daast_from_file(filename, args):
+def daast_from_file(filename, args=None):
     """Generates DistAlgo AST from source file.
 
     'filename' is the filename of source file. Optional argument 'args' is a
@@ -182,6 +117,9 @@ def daast_from_file(filename, args):
         raise e
     return None
 
+
+
+
 def daast_from_str(src, filename='<str>', args=None):
     """Generates DistAlgo AST from source string.
 
@@ -195,7 +133,12 @@ def daast_from_str(src, filename='<str>', args=None):
     try:
         dt = Parser(filename, args)
         rawast = parse(src, filename)
-        dt.visit(rawast)
+        wraw = AstWriter()
+        wraw.write(rawast.body)
+        t = Transformer()
+        tlaast = t.transform(rawast.body)
+        w = Writer(filename)
+        w.write(tlaast)
         sys.stderr.write("%s compiled with %d errors and %d warnings.\n" %
                      (filename, dt.errcnt, dt.warncnt))
         if dt.errcnt == 0:
@@ -257,7 +200,7 @@ KnownUpdateMethods = {
     "delete", "remove", "pop", "clear", "discard"
 }
 
-ValidResetTypes = {"received", "sent", "Received", "Sent", ""}
+ValidResetTypes = {"Received", "Sent", ""}
 ApiMethods = frozenset(common.api_registry.keys())
 BuiltinMethods = frozenset(common.builtin_registry.keys())
 InternalMethods = frozenset(common.internal_registry.keys())
@@ -274,6 +217,16 @@ ComprehensionTypes = {KW_COMP_SET, KW_COMP_TUPLE, KW_COMP_DICT, KW_COMP_LIST}
 EventKeywords = {KW_EVENT_DESTINATION, KW_EVENT_SOURCE, KW_EVENT_LABEL,
                  KW_EVENT_TIMESTAMP}
 Quantifiers = {KW_UNIVERSAL_QUANT, KW_EXISTENTIAL_QUANT}
+
+##########
+# Exceptions:
+class MalformedStatementError(Exception):
+    def __init__(self, reason=None, node=None, name=None, msg=None):
+        super().__init__(reason, node, name, msg)
+        self.reason = reason
+        self.node = node
+        self.name = name
+        self.msg = msg
 
 ##########
 # Name context types:
@@ -300,7 +253,7 @@ class PatternParser(NodeVisitor):
     """Parses a pattern.
     """
 
-    def __init__(self, parser, literal=False, local_only=False):
+    def __init__(self, parser, literal=False):
         self._parser = parser
         self.namescope = parser.current_scope
         self.parent_node = parser.current_parent
@@ -310,7 +263,6 @@ class PatternParser(NodeVisitor):
         self.use_top_semantic = parser.get_option('use_top_semantic',
                                                   default=False)
         self.literal = literal
-        self.local_only = local_only
 
     def visit(self, node):
         if isinstance(node, Name):
@@ -401,7 +353,7 @@ class PatternParser(NodeVisitor):
                 n.add_read(pat)
             else:
                 self._parser.debug("[PatternParser] free name " + name, node)
-                n = self.namescope.find_name(name, local=self.local_only)
+                n = self.namescope.find_name(name)
                 if n is None:
                     # New name:
                     n = self.namescope.add_name(name)
@@ -471,7 +423,7 @@ class Pattern2Constant(NodeVisitor):
         return expr
 
     def visit_BoundPattern(self, node):
-        return dast.NameExpr(node.parent, value=node.value)
+        return das.SimpleExpr(node.parent, value=node.value)
 
     def visit_FreePattern(self, node):
         # This really shouldn't happen
@@ -516,14 +468,13 @@ class PatternFinder(NodeVisitor):
     visit_NameConstant = visit_Constant
 
 
-class Parser(NodeVisitor, CompilerMessagePrinter):
+class Parser(NodeVisitor):
     """The main parser class.
     """
 
-    def __init__(self, filename="", options=None, execution_context=None,
-                 _package=None, _parent=None):
+    def __init__(self, filename="", options=None, execution_context=None):
         # used in error messages:
-        CompilerMessagePrinter.__init__(self, filename, _parent=_parent)
+        self.filename = filename
         # used to construct statement tree, also used for symbol table:
         self.state_stack = []
         # new statements are appended to this list:
@@ -532,13 +483,12 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         self.current_label = None
         # Allows temporarily overriding `current_process`:
         self._dummy_process = None
-        self.program = execution_context
+        self.errcnt = 0
+        self.warncnt = 0
+        self.program = execution_context if execution_context is not None \
+                       else dast.Program() # Just in case
         self.cmdline_args = options
         self.module_args = Namespace()
-        from .symtab import Resolver
-        self.resolver = Resolver(filename, options,
-                                 _package if _package else options.module_name,
-                                 _parent=self)
 
     def get_option(self, option, default=None):
         if hasattr(self.cmdline_args, option):
@@ -624,7 +574,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
     def visit_Module(self, node):
         dast.DistNode.reset_index()
         self.parse_module_header(node)
-        self.program = dast.Program(None, ast=node)
+        self.program = dast.Program(None, node)
         self.program._compiler_options = self.module_args
         # Populate global scope with Python builtins:
         for name in PythonBuiltins:
@@ -667,28 +617,24 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                 self.debug("option not recognized: " + o, node.body[0])
         del node.body[0]
 
-    def parse_bases(self, node, clsobj):
-        """Processes a ClassDef's bases list."""
+    def parse_bases(self, node):
+        """Scans a ClassDef's bases list and checks whether the class defined by
+           'node' is a DistProcess.
+
+        A DistProcess is a class whose bases contain the name $KW_PROCESS_DEF.
+        """
+        isproc = False
         bases = []
         for b in node.bases:
-            if not (isinstance(b, Name) and b.id == KW_PROCESS_DEF):
-                self.current_context = Read(clsobj)
+            if (isinstance(b, Name) and b.id == KW_PROCESS_DEF):
+                isproc = True
+            else:
                 bases.append(self.visit(b))
-        if isinstance(clsobj, dast.Process):
-            # try to resolve the base classes:
-            for b in bases:
-                try:
-                    pd = self.resolver.find_process_definiton(b)
-                    clsobj.merge_scope(pd)
-                except ResolverException as e:
-                    self.warn('unable to resolve base class spec, '
-                              'compilation may be incomplete: {}.'
-                              .format(e.reason), e.node if e.node else b)
-        return bases
+        return isproc, bases
 
-    def parse_pattern_expr(self, node, literal=False, local_only=False):
+    def parse_pattern_expr(self, node, literal=False):
         expr = self.create_expr(dast.PatternExpr, node)
-        pp = PatternParser(self, literal, local_only)
+        pp = PatternParser(self, literal)
         pattern = pp.visit(node)
         if pattern is None:
             self.error("invalid pattern", node)
@@ -703,8 +649,6 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         labels = set()
         notlabels = set()
         decorators = []
-        is_static = False
-
         for exp in node.decorator_list:
             if isinstance(exp, Call) and isinstance(exp.func, Name) and \
                exp.func.id == KW_DECORATOR_LABEL:
@@ -715,10 +659,8 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                     else:
                         labels |= l
             else:
-                if isinstance(exp, Name) and exp.id == 'staticmethod':
-                    is_static = True
                 decorators.append(self.visit(exp))
-        return decorators, labels, notlabels, is_static
+        return decorators, labels, notlabels
 
     def parse_label_spec(self, expr):
         negated = False
@@ -776,7 +718,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                 else:
                     labels |= ls
                 continue
-            pat = self.parse_pattern_expr(patexpr, local_only=True)
+            pat = self.parse_pattern_expr(patexpr)
             if key.arg == KW_MSG_PATTERN:
                 events.append(dast.Event(self.current_process, ast=node,
                                          event_type=eventtype, pattern=pat))
@@ -811,7 +753,6 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
 
         Process bodies differs from normal ClassDef bodies in that the names
         defined in this scope are visible to the whole process.
-
         """
         for stmt in statements:
             if (isinstance(stmt, FunctionDef) and stmt.name not in
@@ -889,7 +830,8 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
     # Top-level blocks:
 
     def visit_ClassDef(self, node):
-        if is_process_class(node):
+        isproc, bases = self.parse_bases(node)
+        if isproc:
             if type(self.current_parent) is not dast.Program:
                 self.error("Process definition must be at top level.", node)
 
@@ -906,13 +848,13 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                 self.warn("Process missing 'setup()' definition.", node)
 
             n = self.current_scope.add_name(node.name)
-            proc = dast.Process(self.current_parent, node, name=node.name)
-            n.add_assignment(proc, proc)
-            proc.decorators, _, _, _ = self.parse_decorators(node)
+            proc = dast.Process(self.current_parent, node,
+                                name=node.name, bases=bases)
+            n.add_assignment(proc)
+            proc.decorators, _, _ = self.parse_decorators(node)
             self.push_state(proc)
             self.program.processes.append(proc)
             self.program.body.append(proc)
-            proc.bases = self.parse_bases(node, proc)
 
             if initfun is not None:
                 self.signature(initfun.args)
@@ -936,16 +878,16 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                           (proc.name, KW_PROCESS_ENTRY_POINT), node)
 
         else:
-            clsobj = dast.ClassStmt(self.current_parent, node, name=node.name)
+            clsobj = dast.ClassStmt(self.current_parent, node,
+                                    name=node.name, bases=bases)
             if self.current_block is None or self.current_parent is None:
                 self.error("Statement not allowed in this context.", ast)
             else:
                 self.current_block.append(clsobj)
                 n = self.current_scope.add_name(node.name)
-                n.add_assignment(clsobj, clsobj)
-            clsobj.decorators, _, _, _ = self.parse_decorators(node)
+                n.add_assignment(clsobj)
+            clsobj.decorators, _, _ = self.parse_decorators(node)
             self.push_state(clsobj)
-            clsobj.bases = self.parse_bases(node, clsobj)
             self.current_block = clsobj.body
             self.body(node.body)
             dbgstr = ["Class ", clsobj.name, " has names: "]
@@ -969,37 +911,27 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
             n = self.current_scope.add_name(node.name)
             s = self.create_stmt(dast.Function, node,
                                  params={"name" : node.name})
-            n.add_assignment(s, s)
-            # Ignore the label decorators:
-            s.decorators, _, _, is_static = self.parse_decorators(node)
+            n.add_assignment(s)
             s.process = self.current_process
             if isinstance(s.parent, dast.Process):
                 if s.name == KW_PROCESS_ENTRY_POINT:
-                    if is_static:
-                        self.error("process entry point can not be static.",
-                                   node)
                     self.current_process.entry_point = s
-                elif s.name == KW_SETUP:
-                    if is_static:
-                        self.error("%s method can not be static." % KW_SETUP,
-                                   node)
+                elif s.name == "setup":
                     self.current_process.setup = s
                 else:
-                    if is_static:
-                        self.current_process.staticmethods.append(s)
-                    else:
-                        self.current_process.methods.append(s)
+                    self.current_process.methods.append(s)
             elif (isinstance(s.parent, dast.Program) and
                   s.name == KW_ENTRY_POINT):
                 # Create the node process:
-                nodecls = dast.Process(self.current_parent,
-                                       ast=node, name=NodeProcName)
-                s.parent.nodecls = nodecls
-                self._dummy_process = s.process = nodecls
+                s.parent.nodecls = dast.Process(self.current_parent, None,
+                                                name=NodeProcName)
+                self._dummy_process = s.process = s.parent.nodecls
                 self._dummy_process.entry_point = s
                 # If we don't pop the entry_point from the module body then it
                 # ends up getting printed twice:
                 self.current_block.pop()
+            # Ignore the label decorators:
+            s.decorators, _, _ = self.parse_decorators(node)
             self.current_block = s.body
             if not self.is_in_setup():
                 self.signature(node.args)
@@ -1016,12 +948,11 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
             h = dast.EventHandler(self.current_parent, node)
             # Parse decorators before adding h to node_stack, since decorators
             # should belong to the outer scope:
-            h.decorators, h.labels, h.notlabels, _ = self.parse_decorators(node)
+            h.decorators, h.labels, h.notlabels = self.parse_decorators(node)
             self.push_state(h)
             events, labels, notlabels = self.parse_event_handler(node)
             events = self.current_process.add_events(events)
             h.events = events
-            h.process = self.current_process
             h.labels |= labels
             h.notlabels |= notlabels
             if len(h.labels) == 0:
@@ -1037,6 +968,18 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
             self.current_block = h.body
             self.body(node.body)
             self.pop_state()
+
+    def check_await(self, node):
+        if (isinstance(node, Call) and
+            isinstance(node.func, Name) and
+            node.func.id == KW_AWAIT):
+            if len(node.args) <= 2:
+                return True
+            else:
+                self.error("malformed await statement.", node)
+                return None
+        else:
+            return False
 
 
     # Statements:
@@ -1114,28 +1057,61 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
             stmtobj = self.create_stmt(dast.ImportStmt, node)
         for alias in node.names:
             if alias.asname is not None:
-                # `alias.asname` can only be a normal (i.e. doesn't contain
-                # dots) name, so we just register that:
                 nobj = self.current_scope.add_name(alias.asname)
                 nalias = dast.Alias(stmtobj, alias,
-                                    name=alias.name, asname=nobj.name)
+                                    name=alias.name, asname=nobj)
             else:
-                # `alias.name` could be a dotted name, in which case we should
-                # register the top-level component instead of the full name,
-                # since any use of the dotted-name will appear as an Attribute
-                # in the AST
-                toplevel = alias.name.split('.')[0]
-                nobj = self.current_scope.add_name(toplevel)
-                nalias = dast.Alias(stmtobj, alias, name=alias.name)
+                nobj = self.current_scope.add_name(alias.name)
+                nalias = dast.Alias(stmtobj, alias, name=nobj)
             nobj.add_assignment(stmtobj)
             stmtobj.items.append(nalias)
         if hasattr(node, 'module'):
-            # This is an 'import from' statement:
             stmtobj.module = node.module
             stmtobj.level = node.level
         self.pop_state()
 
     visit_Import = visit_ImportFrom
+
+    def expr_check(self, names, minargs, maxargs, node,
+                   keywords={}, optional_keywords={}):
+        if not (isinstance(node, Call) and
+                isinstance(node.func, Name) and
+                (((isinstance(names, abc.Set) or
+                   isinstance(names, abc.Mapping)) and
+                  node.func.id in names) or
+                 node.func.id == names)):
+            return False
+
+        try:
+            if minargs is not None and len(node.args) < minargs:
+                raise MalformedStatementError("too few arguments.")
+            if maxargs is not None and len(node.args) > maxargs:
+                raise MalformedStatementError("too many arguments.")
+            if keywords is not None:
+                for kw in node.keywords:
+                    if kw.arg in keywords:
+                        keywords -= {kw.arg}
+                    elif optional_keywords is not None and \
+                         kw.arg not in optional_keywords:
+                        raise MalformedStatementError(
+                            "unrecognized keyword: '%s'." % kw.arg)
+                if len(keywords) > 0:
+                    raise MalformedStatementError(
+                        "missing required keywords: " + str(keywords))
+        except MalformedStatementError as e:
+            # Pre-format an error message for the common case:
+            e.node = node
+            e.name = node.func.id
+            e.msg = "malformed {stname} statement: {msg}".format(
+                stname=e.name, msg=e.reason)
+            raise e
+
+        return True
+
+    def kw_check(self, names, node):
+        if not isinstance(node, Name) or node.id not in names:
+            return False
+        return True
 
     def parse_message(self, node):
         if type(node) is Call and self.get_option('enable_object_pattern',
@@ -1161,7 +1137,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         try:
             e = node.value
             if isinstance(self.current_parent, dast.Program) and \
-               expr_check({KW_INC_VERB}, 1, 1, e):
+               self.expr_check({KW_INC_VERB}, 1, 1, e):
                 # Inc interface directive
                 if isinstance(e.args[0], Str):
                     try:
@@ -1174,10 +1150,9 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                     self.error("%s directive argument must be string." %
                                KW_INC_VERB, e.args[0])
 
-            # Pre-3.7 style await:
-            elif expr_check(KW_AWAIT, 1, 2, e,
-                            keywords={},
-                            optional_keywords={KW_AWAIT_TIMEOUT}):
+            elif self.expr_check(KW_AWAIT, 1, 2, e,
+                                 keywords={},
+                                 optional_keywords={KW_AWAIT_TIMEOUT}):
                 stmtobj = self.create_stmt(dast.AwaitStmt, node)
                 self.current_context = Read(stmtobj)
                 branch = dast.Branch(stmtobj, node,
@@ -1191,16 +1166,8 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                                   e)
                     stmtobj.timeout = self.visit(e.keywords[0].value)
 
-            # Post-3.7 style await:
-            elif isinstance(e, Await):
-                stmtobj = self.create_stmt(dast.AwaitStmt, node)
-                self.current_context = Read(stmtobj)
-                branch = dast.Branch(stmtobj, node,
-                                     condition=self.visit(e.value))
-                stmtobj.branches.append(branch)
-
-            elif expr_check(KW_SEND, 1, 1, e, keywords={KW_SEND_TO},
-                            optional_keywords=None):
+            elif self.expr_check(KW_SEND, 1, 1, e, keywords={KW_SEND_TO},
+                                 optional_keywords=None):
                 stmtobj = self.create_stmt(dast.SimpleStmt, node)
                 self.current_context = Read(stmtobj)
                 stmtobj.expr = self.create_expr(dast.BuiltinCallExpr, e)
@@ -1212,28 +1179,21 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                 self.pop_state()
 
             elif self.current_process is not None and \
-                 expr_check(KW_RESET, 0, 1, e):
+                 self.expr_check(KW_RESET, 0, 1, e):
                 stmtobj = self.create_stmt(dast.ResetStmt, node)
                 self.current_context = Read(stmtobj)
-                if len(e.args) > 1:
-                    raise MalformedStatementError('too many arguments', e)
-                elif len(e.args) == 1:
-                    target = e.args[0]
-                    if not isinstance(target, Name):
-                        self.error("invalid argument in reset statement.", e)
-                    else:
-                        target = target.id.lower()
-                        if target not in ValidResetTypes:
-                            self.error(
-                                "unknown argument in reset statement; "
-                                "valid arguments are: {}".format(ValidResetTypes),
-                                e)
-                        else:
-                            stmtobj.target = target.capitalize()
+                if len(e.args) > 0:
+                    stmtobj.expr = self.visit(e.args[0])
+                    if not isinstance(stmtobj.expr, dast.ConstantExpr):
+                        self.error("Invalid argument in reset statement.", e)
+                    elif stmtobj.expr.value not in ValidResetTypes:
+                        self.error("Unknown argument in reset statement. "
+                                   "Valid arguments are: " +
+                                   str(ValidResetTypes), node)
 
             # Parse 'config' statements. These may appear at the module level or
             # the process level:
-            elif expr_check(KW_CONFIG, 0, None, e, keywords=None):
+            elif self.expr_check(KW_CONFIG, 0, None, e, keywords=None):
                 if isinstance(self.current_parent, dast.Process) or \
                    (isinstance(self.current_parent, dast.Function) and
                     (self.current_parent.name == KW_ENTRY_POINT or
@@ -1272,7 +1232,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
     # ~~~
 
     def parse_branches_for_await(self, stmtobj, node):
-        """Parse all branches in an await statement.
+        """Parse all branches except the first in an await statement.
 
         'stmtobj' is the DistNode instance of the await statement to be
         populated; 'node' is the input Python AST node corresponding to the
@@ -1283,53 +1243,64 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         for 'while await').
 
         """
-        has_timeout = False
-        else_ = [node]
         while True:
+            else_ = node.orelse
             if len(else_) == 0:
                 break
             elif len(else_) == 1 and isinstance(else_[0], If):
+                # This is an 'elif' branch:
                 node = else_[0]
-                self.debug("checking await branch {}".format(dump(node)))
-                if expr_check(KW_AWAIT_TIMEOUT, 0 ,1, node.test):
-                    # A timeout branch
-                    self.debug("found timeout branch.")
-                    if len(node.test.args) == 1:
-                        if stmtobj.timeout is not None:
-                            self.error(
-                                "malformed await: multiple timeout specs.", node)
-                        stmtobj.timeout = self.visit(node.test.args[0])
+                if self.expr_check(KW_AWAIT_TIMEOUT, 1 ,1, node.test):
+                    stmtobj.timeout = self.visit(node.test.args[0])
+                    if len(stmtobj.orelse) > 0:
+                        self.warn("multiple timeout branches in await"
+                                  " statement, all but the last one will be  "
+                                  " ignored.", node)
                     if stmtobj.timeout is None:
                         self.warn("timeout branch in await statement without "
                                   "a timeout value.", node)
-                    condition = None
-
-                elif is_await(node.test):
-                    # A branch with 'await' keyword
-                    if isinstance(node.test, Await):
-                        condition = self.visit(node.test.value)
-                    else:
-                        condition = self.visit(node.test.args[0])
-
+                        stmtobj.orelse = []
+                    self.current_block = stmtobj.orelse
+                    self.body(node.body)
                 else:
-                    # A normal branch
-                    condition = self.visit(node.test)
-
-                branch = dast.Branch(stmtobj, node.test, condition)
-                self.current_block = branch.body
-                self.body(node.body)
-                stmtobj.branches.append(branch)
-                else_ = node.orelse
+                    branch = dast.Branch(stmtobj, node,
+                                         condition=self.visit(node.test))
+                    self.current_block = branch.body
+                    self.body(node.body)
+                    stmtobj.branches.append(branch)
             else:
-                self.error("malformed await: dangling else.", node)
+                # This is a dangling 'else' branch, treat it as the timeout
+                # branch:
+                if stmtobj.timeout is None:
+                    self.warn("timeout branch in await statement without "
+                              "a timeout value.", node)
+                if len(stmtobj.orelse) > 0:
+                    self.warn("multiple timeout branches in await"
+                              " statement, all but the last one will be  "
+                              " ignored.", node)
+                    stmtobj.orelse = []
+                self.current_block = stmtobj.orelse
+                self.body(else_)
                 break
 
     def visit_If(self, node):
         stmtobj = None
         try:
-            if is_await(node.test):
+            if self.expr_check(KW_AWAIT, 1, 1, node.test):
                 stmtobj = self.create_stmt(dast.AwaitStmt, node)
                 self.current_context = Read(stmtobj)
+                branch = dast.Branch(stmtobj, node.test,
+                                     condition=self.visit(node.test.args[0]))
+                if len(node.test.args) == 2:
+                    stmtobj.timeout = self.visit(node.test.args[1])
+                if len(node.test.keywords) > 0:
+                    if stmtobj.timeout is not None:
+                        self.warn("duplicate timeout spec in await statement.",
+                                  e)
+                    stmtobj.timeout = self.visit(e.keywords[0].value)
+                self.current_block = branch.body
+                self.body(node.body)
+                stmtobj.branches.append(branch)
                 self.parse_branches_for_await(stmtobj, node)
 
             else:
@@ -1366,30 +1337,22 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
     def visit_While(self, node):
         s = None
         try:
-            if kw_check({KW_AWAIT}, node.test):
-                # full form (while await: if ...)
+            if self.kw_check({KW_AWAIT}, node.test):
                 whilenode = node
                 s = self.create_stmt(dast.LoopingAwaitStmt, node)
                 self.current_context = Read(s)
                 if len(node.body) != 1 or not isinstance(node.body[0], If):
                     self.error("malformed 'while await' statement.", node)
-                self.parse_branches_for_await(s, node.body[0])
-                if len(node.orelse) > 0:
-                    self.error(
-                        "malformed 'while await' statement: dangling else.", node)
-
-            elif is_await(node.test):
-                # short-hand form (while await(CONDITION): ...)
-                s = self.create_stmt(dast.LoopingAwaitStmt, node)
-                self.current_context = Read(s)
-                if isinstance(node.test, Await):
-                    condition = self.visit(node.test.value)
-                else:
-                    condition = self.visit(node.test.args[0])
-                branch = dast.Branch(stmtobj, node.test, condition)
-                self.current_block = branch.body
-                self.body(node.body)
-                stmtobj.branches.append(branch)
+                if isinstance(node.body[0], If):
+                    node = node.body[0]
+                    branch = dast.Branch(s, node,
+                                         condition=self.visit(node.test))
+                    self.current_block = branch.body
+                    self.body(node.body)
+                    s.branches.append(branch)
+                    self.parse_branches_for_await(s, node)
+                self.current_block = s.orfail
+                self.body(whilenode.orelse)
 
             else:
                 s = self.create_stmt(dast.WhileStmt, node)
@@ -1456,7 +1419,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
             if h.name is not None:
                 n = self.current_scope.find_name(h.name)
                 if n is None:
-                    n = self.current_scope.add_name(h.name)
+                    self.current_scope.add_name(h.name)
                 n.add_assignment(s)
             if handler.type is not None:
                 h.type = self.visit(handler.type)
@@ -1539,7 +1502,6 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
 
     def visit_Attribute(self, node):
         expr = self.create_expr(dast.AttributeExpr, node)
-        oldctx = self.current_context
         if (isinstance(self.current_context, FunCall) and
                 node.attr in KnownUpdateMethods):
             # Calling a method that is known to update an object's state is an
@@ -1561,29 +1523,29 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                 return expr.value
             # Need to update the namedvar object
             n = self.current_process.find_name(expr.attr)
-            expr = self.create_expr(dast.NameExpr, node)
+            expr = self.create_expr(dast.SimpleExpr, node)
             if n is None:
-                if isinstance(oldctx, Assignment):
+                if (self.is_in_setup() and
+                        isinstance(self.current_context, Assignment)):
                     self.debug("Adding name '%s' to process scope"
                                " from setup()." % node.attr, node)
                     n = self.current_process.add_name(node.attr)
-                    n.add_assignment(oldctx.node, oldctx.type)
+                    n.add_assignment(self.current_context.node,
+                                     self.current_context.type)
                     n.set_scope(self.current_process)
-                elif isinstance(oldctx, FunCall):
-                    self.debug("Explicitly calling method '%s' defined "
-                               "in superclass." % node.attr, node)
-                    n = self.current_process.add_name(node.attr)
-                    n.add_read(expr)
                 else:
                     self.error("Undefined process state variable: " +
                                str(node.attr), node)
             else:
-                if isinstance(oldctx, Assignment) or isinstance(oldctx, Delete):
+                if isinstance(self.current_context, Assignment) or \
+                   isinstance(self.current_context, Delete):
                     self.debug("Assignment to variable '%s'" % str(n), node)
-                    n.add_assignment(oldctx.node, oldctx.type)
-                elif isinstance(oldctx, Update):
+                    n.add_assignment(self.current_context.node,
+                                     self.current_context.type)
+                elif isinstance(self.current_context, Update):
                     self.debug("Update to process variable '%s'" % str(n), node)
-                    n.add_update(oldctx.node, oldctx.type)
+                    n.add_update(self.current_context.node,
+                                 self.current_context.type)
                 else:
                     n.add_read(expr)
             expr.value = n
@@ -1616,13 +1578,11 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         if node.func.id == KW_RECV_QUERY:
             event = dast.Event(self.current_process,
                                event_type=dast.ReceivedEvent,
-                               pattern=pattern,
-                               ast=node)
+                               pattern=pattern)
         elif node.func.id == KW_SENT_QUERY:
             event = dast.Event(self.current_process,
                                event_type=dast.SentEvent,
-                               pattern=pattern,
-                               ast=node)
+                               pattern=pattern)
         else:
             self.error("unknown event specifier", node)
             return None
@@ -1681,7 +1641,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         expr = self.create_expr(dast.PatternExpr if not literal else
                                 dast.LiteralPatternExpr,
                                 node.ast)
-        pattern = dast.TuplePattern(node.parent, ast=node.ast)
+        pattern = dast.TuplePattern(node.parent)
 
         # Pattern structure:
         # (TYPE, ENVELOPE, MESSAGE)
@@ -1693,25 +1653,25 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                     value=self.current_scope.add_name(
                         node.type.__name__)))
         else:
-            pattern.value.append(dast.FreePattern(pattern, ast=node.ast))
+            pattern.value.append(dast.FreePattern(pattern))
 
-        env = dast.TuplePattern(pattern, node.ast)
+        env = dast.TuplePattern(pattern)
         if (len(node.timestamps) == 0):
-            env.value.append(dast.FreePattern(env, node.ast))
+            env.value.append(dast.FreePattern(env))
         elif len(node.timestamps) == 1:
             env.value.append(node.timestamps[0].pattern.clone())
             env.value[-1]._parent = env
         else:
             self.error("multiple timestamp spec in event pattern.", node)
         if (len(node.destinations) == 0):
-            env.value.append(dast.FreePattern(env, node.ast))
+            env.value.append(dast.FreePattern(env))
         elif len(node.destinations) == 1:
             env.value.append(node.destinations[0].pattern.clone())
             env.value[-1]._parent = env
         else:
             self.error("multiple destination spec in event pattern.", node)
         if (len(node.sources) == 0):
-            env.value.append(dast.FreePattern(env, node.ast))
+            env.value.append(dast.FreePattern(env))
         elif len(node.sources) == 1:
             env.value.append(node.sources[0].pattern.clone())
             env.value[-1]._parent = env
@@ -1720,7 +1680,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
 
         pattern.value.append(env)
         if node.pattern is None:
-            msgpat = dast.FreePattern(pattern, node.ast)
+            msgpat = dast.FreePattern(pattern)
         else:
             msgpat = node.pattern.pattern.clone()
             msgpat._parent = pattern
@@ -1733,9 +1693,9 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         try:
             if (self.current_process is not None and
                     isinstance(node, Call) and
-                    expr_check({KW_RECV_QUERY, KW_SENT_QUERY},
-                               1, 1, node,
-                               optional_keywords=EventKeywords)):
+                    self.expr_check({KW_RECV_QUERY, KW_SENT_QUERY},
+                                    1, 1, node,
+                                    optional_keywords=EventKeywords)):
                 return True
             elif (isinstance(node, Compare) and len(node.ops) == 1 and
                   type(node.ops[0]) is In):
@@ -1749,9 +1709,9 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
     def parse_domain_spec(self, node):
         if (self.current_process is not None and
                 isinstance(node, Call) and
-                expr_check({KW_RECV_QUERY, KW_SENT_QUERY},
-                           1, 1, node,
-                           optional_keywords=EventKeywords)):
+                self.expr_check({KW_RECV_QUERY, KW_SENT_QUERY},
+                                1, 1, node,
+                                optional_keywords=EventKeywords)):
             # As a short hand, "sent" and "rcvd" can be used as a domain
             # spec: some(rcvd(EVENT_PATTERN) | PRED) is semantically
             # equivalent to some(EVENT_PATTERN in rcvd | PRED).
@@ -1967,16 +1927,16 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
 
     def visit_Call(self, node):
         try:
-            if expr_check(Quantifiers, 1, None, node,
-                          optional_keywords={KW_SUCH_THAT}):
+            if self.expr_check(Quantifiers, 1, None, node,
+                               optional_keywords={KW_SUCH_THAT}):
                 return self.parse_quantified_expr(node)
 
-            if expr_check(ComprehensionTypes, 2, None, node):
+            if self.expr_check(ComprehensionTypes, 2, None, node):
                 return self.parse_comprehension(node)
 
             if self.current_process is not None and \
-               expr_check({KW_RECV_QUERY, KW_SENT_QUERY}, 1, 1, node,
-                          optional_keywords=EventKeywords):
+               self.expr_check({KW_RECV_QUERY, KW_SENT_QUERY}, 1, 1, node,
+                               optional_keywords=EventKeywords):
                 if isinstance(self.current_context, IterRead):
                     if node.func.id == KW_RECV_QUERY:
                         expr = self.create_expr(dast.ReceivedExpr, node)
@@ -2019,30 +1979,30 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
             return dast.SimpleExpr(self.current_parent)
 
         expr = None
-        if expr_check(ApiMethods, None, None, node,
-                      keywords=None, optional_keywords=None):
+        if self.expr_check(ApiMethods, None, None, node,
+                           keywords=None, optional_keywords=None):
             self.debug("Api method call: " + node.func.id, node)
             expr = self.create_expr(dast.ApiCallExpr, node)
             expr.func = node.func.id
-        elif expr_check(BuiltinMethods, None, None, node,
-                        keywords=None, optional_keywords=None):
+        elif self.expr_check(BuiltinMethods, None, None, node,
+                             keywords=None, optional_keywords=None):
             self.debug("Builtin method call: " + node.func.id, node)
             expr = self.create_expr(dast.BuiltinCallExpr, node)
             expr.func = node.func.id
-        elif expr_check({KW_SETUP}, None, None, node,
-                        keywords=None, optional_keywords=None):
+        elif self.expr_check({KW_SETUP}, None, None, node,
+                             keywords=None, optional_keywords=None):
             self.debug("Setup expression. ", node)
             expr = self.create_expr(dast.SetupExpr, node)
-        elif expr_check({KW_START}, None, None, node,
-                        keywords=None, optional_keywords=None):
+        elif self.expr_check({KW_START}, None, None, node,
+                             keywords=None, optional_keywords=None):
             self.debug("Start expression. ", node)
             expr = self.create_expr(dast.StartExpr, node)
-        elif expr_check({KW_CONFIG}, None, None, node,
-                        keywords=None, optional_keywords=None):
+        elif self.expr_check({KW_CONFIG}, None, None, node,
+                             keywords=None, optional_keywords=None):
             self.debug("Config expression. ", node)
             expr = self.create_expr(dast.ConfigExpr, node)
-        elif expr_check(AggregateMap, 1, None, node,
-                        keywords={}, optional_keywords={}):
+        elif self.expr_check(AggregateMap, 1, None, node,
+                             keywords={}, optional_keywords={}):
             self.debug("Aggregate: " + node.func.id, node)
             expr = self.create_expr(AggregateMap[node.func.id], node)
         else:
@@ -2100,8 +2060,8 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
             return expr
 
         # NamedVar is not by itself an Expression, we'll have to wrap it in a
-        # NameExpr:
-        expr = self.create_expr(dast.NameExpr, node)
+        # SimpleExpr:
+        expr = self.create_expr(dast.SimpleExpr, node)
         n = self.current_scope.find_name(node.id, local=False)
         if isinstance(self.current_context, Assignment) or\
            isinstance(self.current_context, Delete):
@@ -2117,7 +2077,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                           node.id, node)
                 self.debug(str(self.current_scope.parent_scope), node)
                 n = self.current_scope.add_name(node.id)
-            n.add_update(self.current_context.node,
+            n.add_update(self.current_context.node, None,
                          self.current_context.type)
         elif isinstance(self.current_context, Read) or \
              isinstance(self.current_context, FunCall):
@@ -2288,8 +2248,7 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         if isinstance(self.current_context, Assignment) or\
            isinstance(self.current_context, Delete):
             # Assignment to an index position is an update to the container:
-            self.current_context = Update(self.current_context.node,
-                                          self.current_context.type)
+            self.current_context = Update(self.current_context.node)
         expr.value = self.visit(node.value)
         self.current_context = Read(expr)
         expr.index = self.visit(node.slice)
@@ -2391,6 +2350,28 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
         expr.value = self.visit(node.value)
         self.pop_state()
         return expr
+
+    # Helper Nodes
+
+    def error(self, mesg, node):
+        self.errcnt += 1
+        if node is not None:
+            printe(mesg, node.lineno, node.col_offset, self.filename)
+        else:
+            printe(mesg, 0, 0, self.filename)
+
+    def warn(self, mesg, node):
+        self.warncnt += 1
+        if node is not None:
+            printw(mesg, node.lineno, node.col_offset, self.filename)
+        else:
+            printw(mesg, 0, 0, self.filename)
+
+    def debug(self, mesg, node=None):
+        if node is not None:
+            printd(mesg, node.lineno, node.col_offset, self.filename)
+        else:
+            printd(mesg, 0, 0, self.filename)
 
 if __name__ == "__main__":
     pass

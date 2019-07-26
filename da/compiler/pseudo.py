@@ -1,7 +1,7 @@
-# Copyright (c) 2010-2017 Bo Lin
-# Copyright (c) 2010-2017 Yanhong Annie Liu
-# Copyright (c) 2010-2017 Stony Brook University
-# Copyright (c) 2010-2017 The Research Foundation of SUNY
+# Copyright (c) 2010-2016 Bo Lin
+# Copyright (c) 2010-2016 Yanhong Annie Liu
+# Copyright (c) 2010-2016 Stony Brook University
+# Copyright (c) 2010-2016 The Research Foundation of SUNY
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -161,9 +161,11 @@ class DastUnparser:
     ########################################################
 
     def _Program(self, tree):
+        # for stmt in tree.processes:
+        #     self.dispatch(stmt)
+        # if tree.entry_point:
+        #     self.dispatch(tree.entry_point)
         self.dispatch(tree.body)
-        if tree.nodecls:
-            self.dispatch(tree.nodecls)
 
     # stmt
     def _SimpleStmt(self, tree):
@@ -201,13 +203,13 @@ class DastUnparser:
             self.write(" ")
             self.dispatch(t.value)
 
-    def _NoopStmt(self, _):
+    def _NoopStmt(self, t):
         self.fill("pass")
 
-    def _BreakStmt(self, _):
+    def _BreakStmt(self, t):
         self.fill("break")
 
-    def _ContinueStmt(self, _):
+    def _ContinueStmt(self, t):
         self.fill("continue")
 
     def _DeleteStmt(self, t):
@@ -238,24 +240,23 @@ class DastUnparser:
         self._do_await_branches(t)
 
     def _do_await_branches(self, t):
-        if len(t.branches) == 1 and not t.branches[0].body:
+        if len(t.branches) == 1 and not t.branches[0].body and not t.orelse:
             # single-line await
             self.write(" ")
             self.dispatch(t.branches[0].condition)
         if t.timeout:
             self.write(" until ")
             self.dispatch(t.timeout)
-        if len(t.branches) > 1 or t.branches[0].body:
+        if len(t.branches) > 1 or t.branches[0].body or t.orelse:
             self.enter()
             for b in t.branches:
-                if b.condition is not None:
-                    self.fill("if ")
-                    self.dispatch(b)
-                else:
-                    self.fill("if timeout")
-                    self.enter()
-                    self.dispatch(b.body)
-                    self.leave()
+                self.fill("if ")
+                self.dispatch(b)
+            if t.orelse:
+                self.fill("if timeout")
+                self.enter()
+                self.dispatch(t.orelse)
+                self.leave()
             self.leave()
 
 
@@ -271,8 +272,16 @@ class DastUnparser:
         self.write(" to ")
         self.dispatch(t.target)
 
+    def _OutputStmt(self, t):
+        self.fill("output ")
+        interleave(lambda: self.write(', '), self.dispatch, t.message)
+        if t.level:
+            self.write(" at level ")
+            self.dispatch(t.level)
+
     def _ResetStmt(self, t):
-        self.fill("reset %s" % t.target)
+        self.fill("reset ")
+        self.dispatch(t.expr)
 
     def _YieldStmt(self, t):
         self.write("(")
@@ -301,7 +310,7 @@ class DastUnparser:
             self.write(" from ")
             self.dispatch(t.cause)
 
-    def _PassStmt(self, _):
+    def _PassStmt(self, t):
         self.fill("pass")
 
     def _TryStmt(self, t):
@@ -435,16 +444,11 @@ class DastUnparser:
             self.write(EVENT_TYPES[evt.type] + " ")
             self.dispatch(evt)
         if t.labels:
-            self.write(" at labels ")
-            interleave(lambda: self.write(", "), self.write, t.labels)
-            if t.notlabels:
-                self.write(" but not labels ")
-                interleave(lambda: self.write(", "), self.write, t.notlabels)
-        else:
-            self.write(" at all labels")
-            if t.notlabels:
-                self.write(" except ")
-                interleave(lambda: self.write(", "), self.write, t.notlabels)
+            self.write("at labels ")
+            self.write(t.labels)
+        if t.notlabels:
+            self.write("but not labels ")
+            self.write(t.notlabels)
         self.enter()
         self.dispatch(t.body)
         self.leave()
@@ -525,16 +529,16 @@ class DastUnparser:
         else:
             self.write(repr(t.value))
 
-    def _SelfExpr(self, _):
+    def _SelfExpr(self, t):
         self.write("self")
 
-    def _TrueExpr(self, _):
+    def _TrueExpr(self, t):
         self.write("True")
 
-    def _FalseExpr(self, _):
+    def _FalseExpr(self, t):
         self.write("False")
 
-    def _NoneExpr(self, _):
+    def _NoneExpr(self, t):
         self.write("None")
 
     def _NamedVar(self, t):
@@ -718,12 +722,6 @@ class DastUnparser:
 
     _BuiltinCallExpr = _CallExpr
     _ApiCallExpr = _CallExpr
-    _SetupExpr = _CallExpr
-    _StartExpr = _CallExpr
-    _ConfigExpr = _CallExpr
-
-    def _NameExpr(self, t):
-        self.dispatch(t.value)
 
     def _AttributeExpr(self,t):
         self.dispatch(t.value)
@@ -759,7 +757,7 @@ class DastUnparser:
         self.dispatch(t.value)
 
     # slice
-    def _EllipsisExpr(self, _):
+    def _EllipsisExpr(self, t):
         self.write("...")
 
     # argument
@@ -810,11 +808,9 @@ class DastUnparser:
         # keyword-only arguments
         if t.kwonlyargs:
             for a, d in zip(t.kwonlyargs, t.kw_defaults):
-                if first:
-                    first = False
-                else:
-                    self.write(", ")
-                self.dispatch(a)
+                if first:first = False
+                else: self.write(", ")
+                self.dispatch(a),
                 if d:
                     self.write("=")
                     self.dispatch(d)
@@ -854,7 +850,7 @@ class DastUnparser:
             self.write(t.name + " as ")
             self.dispatch(t.asname)
         else:
-            self.write(t.name)
+            self.dispatch(t.name)
 
     def _callargs(self, t):
         comma = False
