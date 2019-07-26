@@ -1,4 +1,4 @@
-macro handle_${PROCESS_NAME PLACEHOLDER}(msg, snd) {
+macro handle_${PROCESS_NAME_PLACEHOLDER}(msg, snd) {
     \* BODGE : direct access to local variables of the process!!
     ${BODY_PLACEHOLDER}
     }

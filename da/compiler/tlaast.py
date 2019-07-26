@@ -260,6 +260,8 @@ id_offset_for_communication = []
 handlers = []
 handlers_body = []
 handlers_conditions = []
+processes = []
+process_bodies =[]
 
 class FileFormatter:
     def __init__(self):
@@ -270,12 +272,13 @@ class FileFormatter:
         self.handler_index = -1
 
     def ast2file(self, node):
-        global id_offset, id_offset_for_communication, handlers, handlers_conditions, handlers_body
+        global id_offset, id_offset_for_communication, handlers, handlers_conditions, handlers_body, processes,process_bodies
         if type(node) is TlaImportCopy:
             return ""
         if type(node) is TlaProcessDef:
             self.processName = []
             self.in_handler = False
+            self.in_variables = False
             self.parentProcessName = node.name
             self.counter = 0
             self.processName.append(node.name)
@@ -284,7 +287,9 @@ class FileFormatter:
                 value = id_offset
                 id_offset = id_offset + 1
                 id_offset_for_communication.append((node.name,value, 0))
-                return "process (" + node.name +" = "+ str(value) + ")\n"
+                processes.append("process (" + node.name +" = "+ str(value) + ")\n")
+                process_bodies.append("")
+                return ""
 
             else:
                 value = id_offset
@@ -292,9 +297,9 @@ class FileFormatter:
                 id_offset_for_communication.append((node.name,value,value + processDef[0][1]))
                 return "process (" + node.name + " \in " +str(value) + ".." + str(value + processDef[0][1]) + ")\n"
         if type(node) is TlaVariablesDef:
-            return "variables"
+            processes[id_offset - 1] += "\t" + "variables"
+            return ""
         if type(node) is TlaAssignDef:
-            out = ""
             if type(node.right) is str:
                 out = node.left + " = " + "\"" + node.right + "\"" + ","
             else:
@@ -303,10 +308,15 @@ class FileFormatter:
                 if len(handlers_body) == self.handler_index:
                     handlers_body.append([])
                 handlers_body[self.handler_index].append(out)
-            return out
+                return ""
+            if self.in_variables:
+                processes[id_offset - 1] += "\n" + out
+            else:
+                process_bodies[id_offset - 1] += "\n" + out
+            return ""
         if type(node) is TlaFunctionDef:
             if node.name != 'run' and node.name != 'setup':
-                handler = handlerTemplate.replace("${PROCESS_NAME PLACEHOLDER}",
+                handler = handlerTemplate.replace("${PROCESS_NAME_PLACEHOLDER}",
                                                   self.parentProcessName + "_" + str(self.counter))
                 self.in_handler = True
                 self.counter += 1
@@ -328,8 +338,10 @@ class FileFormatter:
             if self.in_handler:
                 if len(handlers_body) == self.handler_index:
                     handlers_body.append([])
-                handlers_body[self.handler_index].append("call " + node.left + "(" + node.right.replace("(", "<").replace(")", ">>", 1).replace("to =", " self,"))
-            return  "call " + node.left + "(" + node.right.replace("(", "<").replace(")", ">>", 1).replace("to =", " self,")
+                handlers_body[self.handler_index].append( node.left + "(" + node.right.replace("(", "<").replace(")", ">>", 1).replace("to =", " self,"))
+                return ""
+            process_bodies[id_offset - 1] += "\n" + node.left + "(" + node.right.replace("(", "<").replace(")", ">>", 1).replace("to =", " self,")
+            return ""
 
         if type(node) is TlaExprDef and node.left is 'await':
             # if node.right.startswith("some(received"):
@@ -343,14 +355,18 @@ class FileFormatter:
                 listReceived.append(procReceive.replace("${PROCESS_RECEIVE_PLACEHOLDER}", "self" ))
             else:
                 listReceived.append(procReceive.replace("${PROCESS_RECEIVE_PLACEHOLDER}", str(check_proc[0][1]) ))
-            return "call receive_messages_" + str(self.processName[0]) + "()"
+
+            process_bodies[id_offset - 1] += "\n" + "call receive_messages_" + str(self.processName[0]) + "()"
+            return ""
 
         if type(node) is TlaExprDef and node.left is "output":
             if self.in_handler:
                 if len(handlers_body) == self.handler_index:
                     handlers_body.append([])
                 handlers_body[self.handler_index].append("print" + str(node.right))
-            return "print" + str(node.right)
+                return ""
+            process_bodies[id_offset - 1] += "\n" + "print" + str(node.right)
+            return ""
 
 
         return ""
@@ -361,6 +377,7 @@ listReceived = []
 receiveTemplate = open("receive_template.txt").read()
 handlerTemplate = open("handler_template.txt").read()
 sendFunction = open("send_template.txt").read()
+process = open("process_template.txt").read()
 
 class Writer:
     def __init__(self, filename):
@@ -373,7 +390,13 @@ class Writer:
         self.tabCounter += 1
         string = tabs(self.tabCounter)
         for node in tlaast:
-            self.process += string + self.formatter.ast2file(node) + "\n"
+            if type(node) is TlaVariablesDef:
+                self.formatter.in_variables = True
+            if type(node) is TlaFunctionDef:
+                self.formatter.in_variables = False
+            temp = self.formatter.ast2file(node)
+            if temp != "":
+                self.process += string + self.formatter.ast2file(node) + "\n"
             if hasattr(node, 'children') and type(node) is not TlaFunctionDefMAIN:
                 self.writeResursively(node.children)
             if hasattr(node, 'body') and type(node) is not TlaFunctionDefMAIN:
@@ -381,11 +404,16 @@ class Writer:
         self.tabCounter -= 1
 
     def write(self, tlaast):
-        global handlers
+        global handlers, process
         self.writeResursively(tlaast)
         result = fullTemplate
-        result = result.replace("${PROCESS_PLACEHOLDER}", self.process)
         i = 0
+        while i < len(processes):
+            _process = process.replace("${PROCESS_HEADER_PLACEHOLDER}", processes[i])
+            _process = _process.replace("${PROCESS_FUNCTIONS_PLACEHOLDER}", process_bodies[i])
+            self.process += _process + "\n"
+            i += 1
+        result = result.replace("${PROCESS_PLACEHOLDER}", self.process)
         while i < len(handlers):
             handlers[i] = handlers[i].replace("${BODY_PLACEHOLDER}", ft.reduce(lambda accum, value: accum + "\n" + value, handlers_body[i]))
             i += 1

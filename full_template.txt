@@ -31,9 +31,9 @@ CONSTANT N (* amount of client processes*)
 
 ${HANDLER_PLACEHOLDER}
 
-(*---------------------------------procedures----------------------------------------*)
-
 ${SEND_PLACEHOLDER}
+
+(*---------------------------------procedures----------------------------------------*)
 
 ${RECEIVE_PLACEHOLDER}
 
