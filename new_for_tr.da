@@ -1,0 +1,46 @@
+import sys
+class Ping(process):
+    def setup(p, msg_in, incr):
+        self.msg_back = None
+        some(y in p)
+        self.process = y
+
+
+    def run():
+        send(('Ping',msg_in, incr,), to=p)
+        output("wait in ping")
+        await(some(received(('Pong',_))))
+        output(msg_back)
+
+    def receive(msg=('Pong',x, incr), from_=p):
+        output("Pinged", x, incr)
+        self.msg_back = x
+
+
+
+class Pong(process):
+    def setup(p:Ping):
+        self.msg_out = None
+        some(y in p)
+        self.process = y
+
+    def run():
+        output("Waiting")
+        await(some(received(('Ping',_,incr))))
+        output(incr)
+
+    def receive(msg=('Ping',x,incr)):
+        output("Ponged.",x, incr)
+        incr = incr + 1
+        send(('Pong',x,incr), to=p)
+
+def main():
+    pong = new(Pong)
+    ping = new(Ping)
+    incr = 5
+    msg_in = "message pingpong"
+    setup(ping,(pong,msg_in, incr))
+    setup(pong, (ping, ))
+    start(pong)
+    start(ping)
+
