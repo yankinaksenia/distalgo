@@ -1,0 +1,39 @@
+Import sys
+ClassDef Ping
+	Function setup(p, msg_in, incr)
+		Assign msg_back = None
+		Expr some(y in p)
+		Assign process = y
+	Function run()
+		Expr send(("Ping", msg_in, incr),to = p)
+		Expr output("wait in ping")
+		Expr await(some(received(("Pong", _))))
+		Expr output(msg_back)
+	Function receive(msg = ("Pong", x, incr), from_ = p)
+		Expr output("Pinged", x, incr)
+		Assign msg_back = x
+	Function sendingbla(msg = ("lala", x, incr), from_ = p)
+		Expr output("Pinged", x, incr)
+		Assign msg_back = x
+ClassDef Pong
+	Function setup(p)
+		Assign msg_out = None
+		Expr some(y in p)
+		Assign process = y
+	Function run()
+		Expr output("Waiting")
+		Expr await(some(received(("Ping", _, incr))))
+		Expr output(incr)
+	Function receive(msg = ("Ping", x, incr))
+		Expr output("Ponged.", x, incr)
+		Assign incr = incr + 1
+		Expr send(("Pong", x, incr),to = p)
+Function main()
+	Assign pong = new(Pong)
+	Assign ping = new(Ping)
+	Assign incr = 5
+	Assign msg_in = "message pingpong"
+	Expr setup(ping, (pong, msg_in, incr))
+	Expr setup(pong, (ping))
+	Expr start(pong)
+	Expr start(ping)
